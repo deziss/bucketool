@@ -126,6 +126,56 @@ The aws engine sends `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` so aws-cli
 with servers that reject its default CRC checksums. Switching the engine of an existing source
 re-downloads it once (the two clients report LastModified with different precision).
 
+#### Using the aws-cli engine
+
+```bash
+# 1. aws-cli v2 on the host (optional: without it bucketool runs the pinned amazon/aws-cli image)
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o awscliv2.zip
+unzip -q awscliv2.zip && sudo ./aws/install && aws --version      # must print aws-cli/2.x
+```
+
+```yaml
+# 2. switch everything, or one endpoint, to aws-cli
+defaults:
+  engine: aws                        # all endpoints
+
+endpoints:
+  minio_prod:                        # MinIO through aws-cli
+    engine: aws
+    url: "http://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio.example.com:9000?provider=Minio&path_style=true"
+  aws_main:                          # AWS with the instance role / SSO / AWS_PROFILE — no keys in bucketool
+    engine: aws
+    provider: AWS
+    region: ap-south-1
+    env_auth: true
+```
+
+```bash
+# 3. same commands as with rclone
+bucketool parse-url 'http://AK:SK@minio.example.com:9000?provider=Minio&engine=aws'   # engine can sit in the URL
+bucketool test --deep                       # prints "aws-cli v2.x (native|docker)" and "(aws)" per source
+bucketool discover --sizes                  # buckets via s3api list-buckets
+bucketool backup media -n                   # dry run: listing via s3api list-objects-v2
+bucketool backup all
+bucketool verify --latest media --full
+bucketool restore --latest media -t minio_dr --verify full
+bucketool drill media -t scratch -y
+```
+
+```bash
+# 4. cross-check a backup by hand with plain aws-cli (MinIO needs --endpoint-url)
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=us-east-1
+aws --endpoint-url http://minio.example.com:9000 s3 ls s3://media --recursive --summarize | tail -2   # objects + bytes at the source
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["objects"], m["bytes"])' \
+    /backup/s3/media/$(ls /backup/s3/media | grep Z$ | tail -1)/meta.json                            # objects + bytes in the backup
+aws --endpoint-url http://minio.example.com:9000 s3 ls s3://media-restore --recursive | wc -l        # after a restore
+```
+
+Pin a different image with `defaults.aws_image`, or force the container even when aws-cli is
+installed with `defaults.rclone: docker` (that setting governs both clients). Credentials reach
+aws-cli as environment variables inside a subshell only (`AWS_SHARED_CREDENTIALS_FILE=/dev/null`
+unless `env_auth: true`), never on its command line or in `~/.aws`.
+
 ## Everyday use
 
 ```bash
