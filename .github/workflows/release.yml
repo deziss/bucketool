@@ -31,9 +31,12 @@ jobs:
           awk -v v="$ver" '$0 ~ "^## " v "( |$)" {inside=1; next} inside && /^## / {exit} inside {print}' CHANGELOG.md > notes.md
           [ -s notes.md ] || printf 'See [CHANGELOG.md](CHANGELOG.md).\n' > notes.md
 
+      - name: checksums
+        run: sha256sum s3sync.sh install.sh > SHA256SUMS
+
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --latest \
-            s3sync.sh install.sh
+            s3sync.sh install.sh SHA256SUMS

@@ -25,6 +25,7 @@ defaults:
   checkers: 32
   bwlimit: ""                       # "50M", or a timetable: "08:00,10M 20:00,off"
   # max_size: 5G                    # skip objects bigger than this
+  max_delete_percent: 50            # refuse a backup where more than this share of objects vanished (--allow-shrink overrides)
   min_free_space: 10%               # refuse to start when the disk would drop below this (or 20G)
   timeout: 14400                    # seconds per rclone call
   lock_wait: 3600                   # seconds to wait for another run to finish

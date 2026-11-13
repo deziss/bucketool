@@ -39,7 +39,7 @@ examples in `/etc/s3sync`, and never touches an existing `s3sync.yml` / `s3sync.
 `--systemd` enables the nightly backup timer and the weekly verify/drill timer.
 Re-running it is the whole update; without a checkout use `sudo s3sync self-update`.
 
-Requirements: `bash` 4+, `python3` (stdlib only; PyYAML is used if present), GNU coreutils/tar,
+Requirements: `bash` 4.4+, `python3` (stdlib only; PyYAML is used if present), GNU coreutils/tar,
 `flock`, and one S3 client: `rclone` ≥ 1.66, `aws` CLI v2, or `docker` (then the pinned
 `rclone/rclone` or `amazon/aws-cli` image is used).
 Optional: `zstd` (tar.zst), `pigz`, `age` (encryption), `curl` (alerts, self-update).
@@ -158,7 +158,12 @@ list bucket once ─► diff with last manifest ─► link/unlink ─► downlo
    failing every night; a genuine download failure fails the run and the next run resumes it.
 6. **Hash**: SHA-256 for new files; unchanged files inherit their hash only when they are provably
    the same inode as before.
-7. **Commit**: `manifest.jsonl.gz`, `SHA256SUMS`, fsync, atomic rename, then `meta.json` last —
+7. **Shrink guard**: an empty listing where the last backup had objects, or more than
+   `max_delete_percent` (50%) of objects gone at once, stops the run before anything is
+   committed or copied off-site — a broken listing must not become the newest backup.
+   `--allow-shrink` accepts it when the bucket really was emptied. Objects moved to
+   GLACIER/DEEP_ARCHIVE keep the copy from the previous backup.
+8. **Commit**: `manifest.jsonl.gz`, `SHA256SUMS`, fsync, atomic rename, then `meta.json` last —
    a backup without `meta.json` never counts.
 
 On disk:
@@ -225,6 +230,8 @@ s3sync restore -f /backup/s3/media/20261113T013000Z -t minio_dr --mode mirror -y
   objects alone; `mirror` also deletes target objects that are not in the backup (asks first).
 - After every restore the target is listed and compared with the manifest; `--verify full`
   compares every object byte for byte; `--verify none` skips it.
+- Restores refuse a backup marked `verify=failed` (`--force` overrides) and check the files
+  against the manifest before writing anything.
 - A restore into a bucket that a source reads from (compared by host:port and bucket, not by name)
   is refused unless `--force-source`.
 - Folder marker objects (`photos/`) are recreated. Object metadata (Content-Type, user metadata,

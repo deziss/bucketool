@@ -168,7 +168,7 @@ def _parse(lines, i, indent):
         if ind < indent:
             break
         if ind > indent:
-            i += 1; continue
+            die('config: cannot parse the line "%s" (indentation?) — install PyYAML or fix the YAML' % content)
         m = re.match(r'^("[^"]*"|\'[^\']*\'|[^:]+):\s*(.*)$', content)
         if not m:
             i += 1; continue
@@ -292,6 +292,7 @@ DEFAULTS = {
     'timeout': 14400,
     'lock_wait': 3600,
     'part_max_age_days': 7,
+    'max_delete_percent': 50,
     'rclone': 'auto',
     'rclone_image': 'rclone/rclone:1.75.2@sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5',
     'rclone_flags': [],
@@ -312,7 +313,7 @@ CHOICES = {
 }
 INTS = ('compression_level', 'hash_workers', 'retention_days', 'retention_min_keep', 'keep_daily',
         'keep_weekly', 'keep_monthly', 'keep_yearly', 'transfers', 'checkers', 'timeout',
-        'lock_wait', 'part_max_age_days')
+        'lock_wait', 'part_max_age_days', 'max_delete_percent')
 BOOLS = ('zstd_long',)
 LISTS = ('age_recipients', 'rclone_flags')
 OVERRIDABLE = ('format', 'compression_level', 'zstd_long', 'cache', 'verify', 'retention_days',
@@ -399,6 +400,8 @@ def entries(cfg, section):
         if n is None or not NAME_RE.match(str(n)):
             die('%s: every entry needs a name of letters, digits, ".", "_" or "-" (got %r)' % (section, n))
         e['name'] = str(n)
+        if section == 'sources' and e['name'] in ('reports',):
+            die('sources: "%s" is a reserved name' % e['name'])
     return out
 
 
@@ -442,7 +445,7 @@ def parse_s3_url(url):
     return out
 
 
-def _secret(e, keys, envkey, filekey):
+def _secret(e, keys, envkey, filekey, quiet=False):
     v = None
     for a in keys:
         if e.get(a) not in (None, ''):
@@ -462,7 +465,9 @@ def _secret(e, keys, envkey, filekey):
     return v
 
 
-def build_endpoint(e, default_engine='rclone'):
+def build_endpoint(e, default_engine='rclone', need_creds=True):
+    if e.get('name') != 'url':
+        check_keys(e, ENDPOINT_KEYS, 'endpoint')
     base = parse_s3_url(str(e['url'])) if e.get('url') else {'options': {}}
     engine = str(e.get('engine') or base.get('engine') or default_engine).strip().lower()
     if engine not in CHOICES['engine']:
@@ -488,7 +493,7 @@ def build_endpoint(e, default_engine='rclone'):
     ep['options'].update({str(k): v for k, v in opts.items()})
     if ep['endpoint'] and not re.match(r'^https?://', ep['endpoint']):
         ep['endpoint'] = 'https://' + ep['endpoint']
-    if not ep['env_auth'] and not (ep['access_key'] and ep['secret_key']):
+    if need_creds and not ep['env_auth'] and not (ep['access_key'] and ep['secret_key']):
         die('endpoint %s: no credentials (use access_key_env/secret_key_env, a url with key:secret, '
             'or env_auth: true)' % e['name'])
     return ep
@@ -545,7 +550,23 @@ def emit_endpoint(ep, remote, pfx):
 
 
 # ---------- sources / targets ----------
+SOURCE_KEYS = {'name', 'endpoint', 'bucket', 'prefix', 'all_buckets', 'enabled', 'include', 'exclude',
+               'include_buckets', 'exclude_buckets'} | set(OVERRIDABLE)
+TARGET_KEYS = {'name', 'endpoint', 'bucket', 'prefix', 'create', 'scratch', 'verify'}
+ENDPOINT_KEYS = {'name', 'url', 'engine', 'provider', 'endpoint', 'endpoint_url', 'region', 'access_key', 'access_key_id',
+                 'access_key_env', 'access_key_file', 'secret_key', 'secret_access_key', 'secret_key_env',
+                 'secret_key_file', 'session_token', 'session_token_env', 'session_token_file', 'env_auth',
+                 'path_style', 'options'}
+
+
+def check_keys(e, known, what):
+    for k in e:
+        if k not in known:
+            die('%s %s: unknown setting %r (typo?)' % (what, e['name'], k))
+
+
 def build_source(cfg, e, d):
+    check_keys(e, SOURCE_KEYS, 'source')
     w = 'source %s' % e['name']
     out = {
         'NAME': e['name'],
@@ -579,6 +600,7 @@ def build_source(cfg, e, d):
 
 
 def build_target(cfg, e):
+    check_keys(e, TARGET_KEYS, 'target')
     w = 'target %s' % e['name']
     out = {
         'NAME': e['name'],
@@ -730,6 +752,9 @@ def classify(items):
         tier = str(it.get('Tier') or '').upper()
         if not reason and tier in ARCHIVE_TIERS:
             reason = 'storage class %s must be restored on the server before it can be read' % tier
+            skipped.append({'k': key, 's': it.get('Size'), 'reason': reason, 'tier': tier,
+                            'm': mtime_ns(it.get('ModTime'))})
+            continue
         if reason:
             skipped.append({'k': key, 's': it.get('Size'), 'reason': reason})
             continue
@@ -868,6 +893,10 @@ def diff_counts(files, prev):
 def cmd_estimate(listing, prev_manifest):
     files, markers, skipped = classify(load_listing(listing))
     prev, _ = load_manifest(prev_manifest)
+    for sk in skipped:
+        p = prev.get(sk['k']) if sk.get('tier') else None
+        if p is not None and p[0] == sk['s']:
+            files[sk['k']] = (p[0], p[1])
     new, changed, deleted, unchanged, dl, largest = diff_counts(files, prev)
     emit('E_FILES', len(files)); emit('E_BYTES', sum(s for s, _ in files.values()))
     emit('E_NEW', new); emit('E_CHANGED', changed); emit('E_DELETED', deleted)
@@ -882,6 +911,15 @@ def cmd_reconcile(mode, listing, prev_manifest, prev_data, work, sd, redl_file):
     and write the list of objects that still have to be downloaded."""
     files, markers, skipped = classify(load_listing(listing))
     prev, _ = load_manifest(prev_manifest)
+    # an object moved to an archive tier still exists: keep the copy we already have
+    still = []
+    for sk in skipped:
+        p = prev.get(sk['k']) if sk.get('tier') else None
+        if p is not None and p[0] == sk['s']:
+            files[sk['k']] = (p[0], p[1])
+            sk['reason'] += ' (kept the copy from the previous backup)'
+        still.append(sk)
+    skipped = still
     redl = set(read_lines(redl_file))
     os.makedirs(work, exist_ok=True)
     rows, removed = {}, 0
@@ -907,9 +945,7 @@ def cmd_reconcile(mode, listing, prev_manifest, prev_data, work, sd, redl_file):
                 elif st.st_nlink == 1 and abs(st.st_mtime_ns - m) < 10 ** 9:
                     keep = True   # downloaded by an interrupted run of this backup
             elif abs(st.st_mtime_ns - m) < 10 ** 9:
-                keep = True
-                if same_as_prev:
-                    h = p[2]
+                keep = True   # staging mirror: always re-hashed, its bytes are not trusted
         if keep:
             rows[key] = [e[0], e[1], h]
         else:
@@ -1027,8 +1063,9 @@ def cmd_meta_set(path, pairs):
     for p in pairs:
         k, _, v = p.partition('=')
         meta[k] = _coerce(v)
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix='.meta.', dir=os.path.dirname(os.path.abspath(path)))
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
         json.dump(meta, fh, indent=2, sort_keys=True, ensure_ascii=False)
         fh.write('\n')
         fh.flush()
@@ -1076,7 +1113,7 @@ def cmd_resolve(bdir, name):
     hits = []
     for lab in labels_in(bdir):
         b = list_backups(os.path.join(bdir, lab))
-        if b and b[0][2].get('source') == name:
+        if b and str(b[0][2].get('source')) == name:
             hits.append(lab)
     for h in hits:
         print(h)
@@ -1142,6 +1179,8 @@ def cmd_label_policy(cfg, label, pfx):
     e, _ = source_for_label(cfg, label)
     if e is not None:
         d.update(norm_settings({k: e[k] for k in OVERRIDABLE if k in e}, 'source ' + e['name']))
+    if e is not None and 'retention_days' in e and any(d[k] for k in ('keep_daily', 'keep_weekly', 'keep_monthly', 'keep_yearly')):
+        warn('source %s sets retention_days, but keep_* (GFS) is active and takes precedence' % e['name'])
     for k in ('retention_days', 'retention_min_keep', 'keep_daily', 'keep_weekly', 'keep_monthly', 'keep_yearly'):
         emit(pfx + k.upper(), d[k])
     emit(pfx + 'KNOWN', e is not None)
@@ -1414,17 +1453,31 @@ def cmd_discover(cfg, epid, listing):
         print('%s\t%s' % (b, who))
 
 
+def bare_endpoint_id(cfg, name):
+    """endpoint_id without resolving credentials (they may be unreadable for this user)."""
+    e = find(cfg, 'endpoints', name)
+    base = parse_s3_url(str(e['url'])) if e.get('url') else {}
+    ep = {'endpoint': str(e.get('endpoint') or e.get('endpoint_url') or base.get('endpoint') or ''),
+          'region': str(e.get('region') or base.get('region') or '')}
+    if ep['endpoint'] and not re.match(r'^https?://', ep['endpoint']):
+        ep['endpoint'] = 'https://' + ep['endpoint']
+    return endpoint_id(ep)
+
+
 def cmd_bucket_owner(cfg, epid, bucket):
-    """Name of a configured source that reads this bucket on this server (exit 1 if none)."""
+    """Name of a configured source that reads this bucket on this server.
+    Exit 3 when none does; any other failure is an error the caller must not read as 'none'."""
     for e in entries(cfg, 'sources'):
-        if endpoint_id(build_endpoint(find(cfg, 'endpoints', str(e.get('endpoint'))))) != epid:
+        sid = bare_endpoint_id(cfg, str(e.get('endpoint')))
+        # AWS bucket names are global: any two AWS-default endpoints are the same server
+        if sid != epid and not (sid.startswith('aws-') and epid.startswith('aws-')):
             continue
         if as_bool(e.get('all_buckets', False), 'all_buckets'):
             if bucket_selected(bucket, as_list(e.get('include_buckets')), as_list(e.get('exclude_buckets'))):
                 print(e['name']); return
         elif str(e.get('bucket')) == bucket:
             print(e['name']); return
-    sys.exit(1)
+    sys.exit(3)
 
 
 # ---------- list / metrics ----------
@@ -1740,6 +1793,8 @@ VERBOSE=false
 JSON_OUT=false
 NO_OFFSITE=false
 NO_PRUNE=false
+ALLOW_SHRINK=false
+FORCE=false
 WORST=0                      # 0 ok, 3 warnings, 1 failure — the exit status of a multi-source run
 
 BOOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s3sync.XXXXXXXX")"
@@ -1879,9 +1934,9 @@ lock() {  # lock <name> <shared|exclusive> [try]
     if [[ -n ${LOCK_FDS[$name]:-} ]]; then fd=${LOCK_FDS[$name]}
     else exec {fd}>>"$CFG_BACKUP_DIR/.locks/$name.lock" || die "cannot open lock $name"; LOCK_FDS[$name]=$fd; fi
     flock -n "$mode" "$fd" && return 0
+    [[ ${3:-} == try ]] && return 1
     log "waiting up to ${CFG_LOCK_WAIT}s for lock '$name' (another s3sync run holds it)"
     flock -w "$CFG_LOCK_WAIT" "$mode" "$fd" && return 0
-    [[ ${3:-} == try ]] && return 1
     die "lock '$name' is still held by another s3sync run after ${CFG_LOCK_WAIT}s"
 }
 
@@ -2125,15 +2180,23 @@ s3_peek() {  # s3_peek <role> <bucket> <prefix>: can we list it at all?
     else rclone_run lsf --max-depth 1 "$(rpath "$1" "$2" "$3")" >/dev/null; fi
 }
 
-s3_is_empty() {  # s3_is_empty <role> <bucket> <prefix>  (status 0 when no objects, or no bucket yet)
-    s3_bucket_exists "$1" "$2" || return 0
+s3_is_empty() {  # s3_is_empty <role> <bucket> <prefix>  (0 = provably empty; any error counts as not empty)
+    if ! s3_bucket_exists "$1" "$2"; then
+        # missing bucket is empty; an unreachable server is not
+        s3_buckets "$1" "$RUNDIR/empty-check.json" || return 1
+        python3 -c 'import json,sys; sys.exit(1 if any(i.get("Path")==sys.argv[2] for i in json.load(open(sys.argv[1]))) else 0)' \
+            "$RUNDIR/empty-check.json" "$2"
+        return
+    fi
     if [[ $(eng "$1") == aws ]]; then
         local -a pa=()
         [[ -n $3 ]] && pa=(--prefix "$3/")
         [[ "$(aws_run "$1" s3api list-objects-v2 --bucket "$2" ${pa[@]+"${pa[@]}"} --max-items 1 \
               --query 'Contents[0].Key' --output text 2>/dev/null)" == None ]]
     else
-        [[ -z $(rclone_run lsf -R --files-only --max-depth 50 "$(rpath "$1" "$2" "$3")" 2>/dev/null | head -1) ]]
+        local out
+        out="$(rclone_run lsf -R --files-only "$(rpath "$1" "$2" "$3")")" || return 1
+        [[ -z $out ]]
     fi
 }
 
@@ -2288,19 +2351,20 @@ notify() {  # notify <status> <summary>
     if [[ -n $NOTIFY_HEALTHCHECK_URL ]]; then
         local u="$NOTIFY_HEALTHCHECK_URL"
         (( status == 1 )) && u="${u%/}/fail"
-        curl -fsS -m 15 --retry 3 -o /dev/null --data-raw "$summary" "$u" 2>/dev/null || warn "healthcheck ping failed"
+        printf 'url = "%s"\n' "$u" | curl -K - -fsS -m 15 --retry 3 -o /dev/null --data-raw "$summary" 2>/dev/null \
+            || warn "healthcheck ping failed"
     fi
     if [[ -n $NOTIFY_WEBHOOK ]] && { (( status != 0 )) || [[ $NOTIFY_ON_SUCCESS == true ]]; }; then
         curl -fsS -m 15 --retry 2 -o /dev/null -X POST -H 'Content-Type: application/json' \
             -d "{\"tool\":\"s3sync\",\"host\":$(json_str "$(hostname)"),\"status\":\"$word\",\"summary\":$(json_str "$summary")}" \
-            "$NOTIFY_WEBHOOK" 2>/dev/null || warn "webhook notification failed"
+            -K <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK") 2>/dev/null || warn "webhook notification failed"
     fi
     return 0
 }
 
 hc_start() {
     [[ -n $NOTIFY_HEALTHCHECK_URL ]] && have curl && ! $DRY_RUN || return 0
-    curl -fsS -m 10 --retry 2 -o /dev/null "${NOTIFY_HEALTHCHECK_URL%/}/start" 2>/dev/null || true
+    printf 'url = "%s"\n' "${NOTIFY_HEALTHCHECK_URL%/}/start" | curl -K - -fsS -m 10 --retry 2 -o /dev/null 2>/dev/null || true
 }
 
 write_metrics() {
@@ -2488,6 +2552,16 @@ backup_label() {  # backup_label <source-name> <bucket> <label>   (SRC_* loaded;
     cfg_eval estimate "$work/listing.json" "$prevman"
     log "$label: $E_FILES objects ($(human "$E_BYTES")) — new $E_NEW, changed $E_CHANGED, deleted $E_DELETED, unchanged $E_UNCHANGED"
     (( E_SKIPPED > 0 )) && warn "$label: $E_SKIPPED object(s) cannot be stored as files and will be skipped (see skipped.jsonl)"
+    # A short or empty listing must not become the newest backup (and empty the off-site copy).
+    if [[ -n $prev ]] && ! $ALLOW_SHRINK; then
+        local prev_n; prev_n="$(cfgpy meta-get "$prev" objects)"; prev_n="${prev_n:-0}"
+        if (( prev_n > 0 && E_FILES == 0 )); then
+            die "$label: the listing is empty but $(basename "$prev") holds $prev_n objects — refusing (pass --allow-shrink if the bucket really was emptied)"
+        fi
+        if (( prev_n > 0 && E_DELETED * 100 > prev_n * CFG_MAX_DELETE_PERCENT )); then
+            die "$label: $E_DELETED of $prev_n objects disappeared since $(basename "$prev") (> max_delete_percent ${CFG_MAX_DELETE_PERCENT}%) — refusing (pass --allow-shrink if that is expected)"
+        fi
+    fi
     if $DRY_RUN; then
         ok "$label: dry run — would download $E_DL_COUNT object(s), $(human "$E_DL_BYTES"), format $SRC_FORMAT"
         return 0
@@ -2589,11 +2663,11 @@ backup_source() {  # backup_source <source-name>   (one subshell per label)
     local -a buckets=()
     if [[ $SRC_ALL_BUCKETS == true ]]; then
         s3_buckets SRC "$RUNDIR/buckets.json" \
-            || { err "$name: cannot list buckets: $(rclone_err)"; worst 1; return; }
+            || { err "$name: cannot list buckets: $(rclone_err)"; printf '%s\t1\n' "$name" >>"$RUNDIR/results.tsv"; return 0; }
         mapfile -t buckets < <(cfgpy buckets "$RUNDIR/buckets.json" \
             "$(python3 -c 'import json,sys;print(json.dumps({"include":sys.argv[1:sys.argv.index("--")],"exclude":sys.argv[sys.argv.index("--")+1:]}))' \
                ${SRC_INCLUDE_BUCKETS[@]+"${SRC_INCLUDE_BUCKETS[@]}"} -- ${SRC_EXCLUDE_BUCKETS[@]+"${SRC_EXCLUDE_BUCKETS[@]}"})")
-        (( ${#buckets[@]} )) || { warn "$name: no buckets matched"; worst 3; return; }
+        (( ${#buckets[@]} )) || { warn "$name: no buckets matched"; printf '%s\t3\n' "$name" >>"$RUNDIR/results.tsv"; return 0; }
     else
         buckets=("$SRC_BUCKET")
     fi
@@ -2606,7 +2680,6 @@ backup_source() {  # backup_source <source-name>   (one subshell per label)
         set -e
         (( st == 0 || st == 3 )) || err "$label: backup FAILED"
         printf '%s\t%s\n' "$label" "$st" >>"$RUNDIR/results.tsv"
-        worst "$st"
     done
 }
 
@@ -2620,9 +2693,23 @@ cmd_backup() {
     resolve_engines
     hc_start
     : >"$RUNDIR/results.tsv"
-    for n in "${names[@]}"; do backup_source "$n"; done
+    for n in "${names[@]}"; do
+        set +e
+        ( set -e; backup_source "$n" )
+        local st=$?
+        set -e
+        if (( st != 0 )) && ! awk -F"\t" -v n="$n" '$1 == n || index($1, n "_") == 1 {f=1} END {exit !f}' "$RUNDIR/results.tsv"; then
+            err "$n: source could not be set up"
+            printf '%s\t1\n' "$n" >>"$RUNDIR/results.tsv"
+        fi
+    done
+    # the run status is the worst per-label status (subshells cannot set WORST)
+    local lst
+    while IFS=$'\t' read -r _ lst; do worst "$lst"; done <"$RUNDIR/results.tsv"
     if ! $DRY_RUN && ! $NO_PRUNE; then
-        if lock global exclusive try; then prune_all || worst 3
+        if lock global exclusive try; then
+            set +e; ( set -e; prune_all ); local pst=$?; set -e
+            (( pst == 0 )) || { warn "prune failed"; worst 3; }
         else warn "prune skipped: another s3sync run is active"; fi
     fi
     write_metrics
@@ -2708,6 +2795,10 @@ prune_all() {
     for lab in ${labs[@]+"${labs[@]}"}; do
         ldir="$CFG_BACKUP_DIR/$lab"
         cfg_eval label-policy "$CONFIG" "$lab" P_
+        if [[ $P_KNOWN != true ]]; then
+            warn "$lab: no source in the config owns these backups — retention skipped (delete $ldir by hand when done)"
+            continue
+        fi
         while IFS=$'\t' read -r ts why; do
             [[ -n $ts ]] || continue
             if [[ $OFFSITE_ENABLED == true && -z $(cfgpy meta-get "$ldir/$ts" offsite) ]]; then
@@ -2785,6 +2876,7 @@ cmd_verify() {
     fi
     for b in ${dirs[@]+"${dirs[@]}"}; do
         local lab; lab="$(basename "$(dirname "$b")")"
+        lock "label-$lab" exclusive
         local rep; rep="$CFG_BACKUP_DIR/reports/verify_${lab}_$(basename "$b")_$(date -u +%Y%m%dT%H%M%SZ).txt"
         log "verifying $lab/$(basename "$b") ($level)"
         if verify_backup "$b" "$level" "$rep"; then ok "$lab/$(basename "$b"): $level verification passed"
@@ -2826,7 +2918,13 @@ verify_target() {  # verify_target <backup-dir> <target> <sel-file> <quick|full>
 }
 
 is_source_bucket() {  # endpoint-id bucket -> name of a source that reads it (status 1 if none)
-    cfgpy bucket-owner "$CONFIG" "$1" "$2"
+    local out rc=0
+    out="$(cfgpy bucket-owner "$CONFIG" "$1" "$2")" || rc=$?
+    case $rc in
+        0) printf '%s' "$out"; return 0 ;;
+        3) return 1 ;;
+        *) die "cannot decide whether bucket '$2' is backed up by a source — refusing to write to it" ;;
+    esac
 }
 
 pick_backup() {  # pick_backup <latest-name> <at> <file> -> R_BACKUP
@@ -2855,14 +2953,22 @@ restore_core() {
     cfg_eval select "$b/manifest.jsonl.gz" "$prefix" "$R_SEL" ${globs[@]+"${globs[@]}"}
     (( S_COUNT + S_MARKERS > 0 )) || die "nothing in $label/$(basename "$b") matches the selection"
     log "restoring $label/$(basename "$b") ($fmt): $S_COUNT object(s), $(human "$S_BYTES")${prefix:+, prefix $prefix}"
+    local vstate; vstate="$(cfgpy meta-get "$b" verify)"
+    if [[ $vstate == failed || $vstate == pending ]] && ! $FORCE; then
+        die "$label/$(basename "$b") is marked verify=$vstate — pick another backup, or pass --force"
+    fi
 
     local dest=""
     if [[ -n $target ]]; then
         load_target "$target"
         dest="$(target_root)"
         local owner
-        if owner="$(is_source_bucket "$DEP_ID" "$TGT_BUCKET")" && [[ $force_src != true ]]; then
-            die "target $target writes into bucket '$TGT_BUCKET' that source '$owner' backs up — pass --force-source if that is really intended"
+        if owner="$(is_source_bucket "$DEP_ID" "$TGT_BUCKET")"; then
+            [[ $force_src == true ]] \
+                || die "target $target writes into bucket '$TGT_BUCKET' that source '$owner' backs up — pass --force-source if that is really intended"
+            # back into a source bucket: put the objects back under the prefix they came from
+            local mpre; mpre="$(cfgpy meta-get "$b" prefix)"
+            if [[ -z $TGT_PREFIX && -n $mpre ]]; then TGT_PREFIX="$mpre"; dest="$(target_root)"; fi
         fi
         if $DRY_RUN; then
             ok "dry run: would $mode-restore $S_COUNT object(s) ($(human "$S_BYTES")) into $DEP_URL $dest"
@@ -2906,6 +3012,12 @@ restore_core() {
         (( X_COUNT == S_COUNT )) || die "archive gave $X_COUNT object(s), expected $S_COUNT"
     fi
 
+    if [[ $fmt == snapshot ]]; then
+        # the files must be intact before anything is written (mirror deletes on the target)
+        cfgpy verify-tree "$b" "$R_SRCDIR" 0 "$CFG_HASH_WORKERS" "" "$R_SEL" "" >/dev/null \
+            || die "$label/$(basename "$b"): files on disk do not match the manifest — run: s3sync verify $b"
+    fi
+    : >"$RUNDIR/restore.started"
     if [[ -n $todir ]]; then
         if [[ $fmt == snapshot ]]; then
             cfg_eval stage-sel "$R_SRCDIR" "$R_SEL" "$todir" copy   # real copies: the backup must stay untouched
@@ -2986,6 +3098,7 @@ cmd_drill() {
     resolve_engines
     load_target "$target"
     [[ $TGT_SCRATCH == true ]] || die "drill target '$target' must be marked scratch: true — a drill deletes what it restores"
+    if $DRY_RUN; then ok "dry run: would restore ${names[*]} into $target, verify fully, and clean up"; return 0; fi
     local n
     for n in "${names[@]}"; do
         local -a labs=()
@@ -3003,16 +3116,19 @@ cmd_drill() {
             created="$(cfgpy meta-get "$R_BACKUP" finished_epoch)"
             rep="$CFG_BACKUP_DIR/reports/drill_${lab}_$(date -u +%Y%m%dT%H%M%SZ).txt"
             log "drill: $lab/$(basename "$R_BACKUP") -> $target"
+            rm -f "$RUNDIR/restore.started"
             set +e
             ( set -e; trap kill_container EXIT; restore_core "$target" "" "" merge false full false )
             drc=$?
             set -e
             local rto=$(( SECONDS - t0 )); now=$(date +%s)
-            # clean the scratch bucket: only the keys this drill wrote
-            cfg_eval select "$R_BACKUP/manifest.jsonl.gz" "" "$RUNDIR/drill.sel"
-            load_target "$target"
-            s3_delete_sel DST "$TGT_BUCKET" "$TGT_PREFIX" "$RUNDIR/drill.sel" "$RUNDIR/drill.sel.markers" \
-                || warn "drill: cleanup of $target failed: $(rclone_err)"
+            # clean the scratch bucket: only the keys this drill wrote, only if it wrote any
+            if [[ -f $RUNDIR/restore.started ]]; then
+                cfg_eval select "$R_BACKUP/manifest.jsonl.gz" "" "$RUNDIR/drill.sel"
+                load_target "$target"
+                s3_delete_sel DST "$TGT_BUCKET" "$TGT_PREFIX" "$RUNDIR/drill.sel" "$RUNDIR/drill.sel.markers" \
+                    || warn "drill: cleanup of $target failed: $(rclone_err)"
+            fi
             {
                 echo "s3sync drill report"
                 echo "label:   $lab"
@@ -3185,7 +3301,7 @@ cmd_self_update() {
         if [[ $S3SYNC_UPDATE_CHANNEL == release ]]; then
             ref="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${S3SYNC_REPO}/releases/latest" 2>/dev/null \
                    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-            [[ -n $ref ]] || { warn "no published release found for ${S3SYNC_REPO} — falling back to main"; ref=main; }
+            [[ -n $ref ]] || die "no published release found for ${S3SYNC_REPO} (use --main to follow the development branch)"
         else
             ref=main
         fi
@@ -3193,6 +3309,15 @@ cmd_self_update() {
     fi
     log "fetching ${ref:+$ref — }$url"
     curl -fsSL --max-time 60 "$url" -o "$tmp" || die "cannot download $url"
+    if [[ -z $S3SYNC_UPDATE_URL && $ref != main ]]; then
+        # releases publish SHA256SUMS next to the script
+        local sums="$BOOT_DIR/SHA256SUMS" want
+        curl -fsSL --max-time 30 "https://github.com/${S3SYNC_REPO}/releases/download/${ref}/SHA256SUMS" -o "$sums" \
+            || die "release $ref has no SHA256SUMS — refusing an unverifiable update"
+        want="$(awk '$2 == "s3sync.sh" || $2 == "*s3sync.sh" {print $1}' "$sums")"
+        [[ -n $want && "$(sha256sum "$tmp" | awk '{print $1}')" == "$want" ]] || die "checksum mismatch for $url — refusing"
+        ok "checksum verified against the release's SHA256SUMS"
+    fi
     head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || die "downloaded file is not a shell script"
     local newv
     newv="$(sed -n 's/^readonly S3SYNC_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -1)"
@@ -3256,6 +3381,8 @@ GLOBAL OPTIONS
   --json              machine-readable summary (backup)
   --no-offsite        skip the off-site copy
   --no-prune          skip retention after a backup
+  --allow-shrink      accept a backup where most objects vanished (see max_delete_percent)
+  --force             restore from a backup that failed verification
   -V, --version       print the version
 
 EXIT STATUS
@@ -3278,6 +3405,8 @@ main() {
             --json)       JSON_OUT=true; QUIET=true; shift ;;
             --no-offsite) NO_OFFSITE=true; shift ;;
             --no-prune)   NO_PRUNE=true; shift ;;
+            --allow-shrink) ALLOW_SHRINK=true; shift ;;
+            --force)      FORCE=true; shift ;;
             -h|--help)    usage; exit 0 ;;
             -V|--version) echo "$S3SYNC_VERSION"; exit 0 ;;
             -*)           if [[ -n $cmd ]]; then rest+=("$1"); shift
@@ -3293,19 +3422,21 @@ main() {
         _py) python3 "$PY" ${rest[@]+"${rest[@]}"}; exit $? ;;   # internal: tests call the helper directly
     esac
     load_config
-    local rc=0
+    # Commands are called plainly, never as `cmd || rc=$?`: bash suspends set -e
+    # for everything below a command in an ||/&& list, including the guarded
+    # per-source subshells. A command's non-zero return ends the run with that status.
     case "$cmd" in
-        backup)   cmd_backup ${rest[@]+"${rest[@]}"} || rc=$? ;;
-        verify)   cmd_verify ${rest[@]+"${rest[@]}"} || rc=$? ;;
-        restore)  cmd_restore ${rest[@]+"${rest[@]}"} || rc=$? ;;
-        drill)    cmd_drill ${rest[@]+"${rest[@]}"} || rc=$? ;;
-        list)     cmd_list ${rest[@]+"${rest[@]}"} || rc=$? ;;
-        prune)    cmd_prune || rc=$? ;;
-        test)     cmd_test ${rest[@]+"${rest[@]}"} || rc=$? ;;
-        discover) cmd_discover ${rest[@]+"${rest[@]}"} || rc=$? ;;
+        backup)   cmd_backup ${rest[@]+"${rest[@]}"} ;;
+        verify)   cmd_verify ${rest[@]+"${rest[@]}"} ;;
+        restore)  cmd_restore ${rest[@]+"${rest[@]}"} ;;
+        drill)    cmd_drill ${rest[@]+"${rest[@]}"} ;;
+        list)     cmd_list ${rest[@]+"${rest[@]}"} ;;
+        prune)    cmd_prune ;;
+        test)     cmd_test ${rest[@]+"${rest[@]}"} ;;
+        discover) cmd_discover ${rest[@]+"${rest[@]}"} ;;
         *) echo "unknown command: $cmd (see -h)" >&2; exit 2 ;;
     esac
-    exit $rc
+    exit 0
 }
 
 main "$@"

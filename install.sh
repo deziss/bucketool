@@ -38,7 +38,7 @@ OLD=""
 [[ -x "$PREFIX/s3sync.sh" ]] && OLD="$("$PREFIX/s3sync.sh" --version 2>/dev/null || true)"
 NEW="$(sed -n 's/^readonly S3SYNC_VERSION="\([^"]*\)".*/\1/p' "$SRC/s3sync.sh" | head -1)"
 
-install -d -m 0755 "$PREFIX" "$CONF"
+install -d -m 0755 "$PREFIX" "$CONF" "$(dirname "$BIN")"
 install -m 0755 "$SRC/s3sync.sh" "$PREFIX/s3sync.sh"
 for f in README.md SOP.md TROUBLESHOOTING.md CHANGELOG.md; do
     [[ -f "$SRC/$f" ]] && install -m 0644 "$SRC/$f" "$PREFIX/$f"

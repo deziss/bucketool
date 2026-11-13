@@ -21,4 +21,8 @@ First release.
 - `all_buckets` sources, `discover`, `test --deep`, `list` with hardlink savings.
 - Two S3 engines, per endpoint or default: rclone and aws-cli v2 (native or pinned
   `amazon/aws-cli:2.40.2` container); the end-to-end suite runs against both.
+- Safety: shrink guard (`max_delete_percent`, `--allow-shrink`), restores refuse failed backups
+  and pre-check files, fail-closed source-bucket and scratch-emptiness checks, one broken source
+  no longer stops the others, unknown config keys are errors, alert URLs kept out of `ps`,
+  self-update verifies the release's SHA256SUMS.
 - healthchecks/webhook alerts, Prometheus textfile metrics, systemd timers, `install.sh`, `self-update`.

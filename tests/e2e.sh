@@ -210,6 +210,7 @@ printf 'X' | dd of="$B2/data/new/new.txt" bs=1 seek=0 conv=notrunc status=none
 expect 1 "verify --full detects a flipped byte" -- s3 verify --latest media --full
 grep -q 'HASH' "$W/last.out" && ok "report names the damaged object" || bad "no HASH line"
 [[ -f $W/backup/media/.redownload ]] && ok "damaged key flagged for re-download" || bad ".redownload missing"
+expect 1 "restore from a backup that failed verification is refused" -- s3 restore -f "$B2" --to-dir "$W/out-bad"
 cp "$W/new.bak" "$B2/data/new/new.txt"
 expect 0 "verify passes after repair" -- s3 verify --latest media --full
 
@@ -252,6 +253,11 @@ step "all_buckets"
 expect 0 "backup srv (all_buckets, include other)" -- s3 backup srv
 srv=("$W"/backup/srv_other/2*Z)
 [[ -f ${srv[-1]}/data/o.txt ]] && ok "label srv_other" || bad "srv_other"
+
+step "shrink guard"
+mc rm -q e2e/other/o.txt >/dev/null
+expect 1 "empty listing after a non-empty backup is refused" -- s3 backup srv
+expect 0 "--allow-shrink accepts it" -- s3 --allow-shrink backup srv
 
 step "drill"
 expect 1 "drill refuses a non-scratch target" -- s3 drill media -t notscratch
