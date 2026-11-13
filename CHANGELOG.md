@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 — 2026-11-13
+
+- Fix: Ctrl-C now stops a run. `timeout` had moved rclone/aws-cli out of the terminal's
+  process group, so interrupts never reached them and a stuck call waited for `defaults.timeout`.
+- Fix: an endpoint that does not answer no longer hangs for up to hours: connects time out
+  after 15 s (`--contimeout` / `--cli-connect-timeout`), and `test` retries only once, so it
+  reports `dial tcp ... i/o timeout` within about a minute.
+
 ## 1.0.0 — 2026-11-13
 
 First release.

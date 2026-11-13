@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly BUCKETOOL_VERSION="1.0.0"
+readonly BUCKETOOL_VERSION="1.0.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME SCRIPT_DIR
@@ -1793,6 +1793,8 @@ VERBOSE=false
 JSON_OUT=false
 NO_OFFSITE=false
 NO_PRUNE=false
+RC_RETRIES=5                 # rclone --retries / aws max attempts (test lowers them to fail fast)
+RC_LL_RETRIES=20
 ALLOW_SHRINK=false
 FORCE=false
 WORST=0                      # 0 ok, 3 warnings, 1 failure — the exit status of a multi-source run
@@ -1978,7 +1980,7 @@ rclone_exec() {  # rclone with no extra flags; stdout passes through, stdin only
 rclone_exec_in() {
     [[ -n $RCLONE_MODE ]] || resolve_rclone
     if [[ $RCLONE_MODE == native ]]; then
-        timeout --kill-after=60 "$CFG_TIMEOUT" "$RCLONE_BIN" "$@"
+        timeout --foreground --kill-after=60 "$CFG_TIMEOUT" "$RCLONE_BIN" "$@"
     else
         container_run "$CFG_RCLONE_IMAGE" RCLONE_ "$@"
     fi
@@ -1986,7 +1988,7 @@ rclone_exec_in() {
 
 # rclone with the run's transfer settings; stderr is kept for error summaries
 rclone_run() {
-    local -a f=(--retries 5 --low-level-retries 20 --transfers "${X_TRANSFERS:-$CFG_TRANSFERS}"
+    local -a f=(--retries "$RC_RETRIES" --low-level-retries "$RC_LL_RETRIES" --contimeout 15s --transfers "${X_TRANSFERS:-$CFG_TRANSFERS}"
                 --checkers "${X_CHECKERS:-$CFG_CHECKERS}" --stats 0)
     local bw="${X_BWLIMIT:-$CFG_BWLIMIT}"
     [[ -n $bw ]] && f+=(--bwlimit "$bw")
@@ -2017,7 +2019,7 @@ container_run() {  # container_run <image> <env-prefix> args...
     for m in ${DOCKER_MOUNTS[@]+"${DOCKER_MOUNTS[@]}"}; do mounts+=(--mount "type=bind,src=$m,dst=$m"); done
     CONTAINER="bucketool-$$-$RANDOM"
     local rc=0
-    timeout --kill-after=60 "$CFG_TIMEOUT" docker run --rm -i --init --pull never --name "$CONTAINER" \
+    timeout --foreground --kill-after=60 "$CFG_TIMEOUT" docker run --rm -i --init --pull never --name "$CONTAINER" \
         --network host --user "$(id -u):$(id -g)" -e HOME=/tmp ${envs[@]+"${envs[@]}"} "${mounts[@]}" \
         -w "$CFG_BACKUP_DIR" "$image" "$@" || rc=$?
     if (( rc == 0 )); then CONTAINER=""; else kill_container; fi   # a timeout kills the client, not the container
@@ -2066,8 +2068,8 @@ aws_exec() {  # aws_exec <role> [--stdin] args...   credentials exported only in
         if [[ $ps == true || ( -z $ps && $(gv "${p}PROVIDER") != AWS ) ]]; then echo '    addressing_style = path'; fi
         [[ -n $bw ]] && echo "    max_bandwidth = $bw"
     } >"$cfgf"
-    local -a ep=()
-    [[ -n $ep_url ]] && ep=(--endpoint-url "$ep_url")
+    local -a ep=(--cli-connect-timeout 15)
+    [[ -n $ep_url ]] && ep+=(--endpoint-url "$ep_url")
     (
         trap kill_container EXIT
         local v
@@ -2081,9 +2083,10 @@ aws_exec() {  # aws_exec <role> [--stdin] args...   credentials exported only in
         export AWS_CONFIG_FILE="$cfgf" AWS_PAGER="" AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
         # aws-cli >= 2.23 sends CRC checksums by default, which many S3-compatible servers reject
         export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+        export AWS_MAX_ATTEMPTS="$RC_RETRIES" AWS_RETRY_MODE=standard
         if [[ $AWS_MODE == native ]]; then
-            if $stdin; then timeout --kill-after=60 "$CFG_TIMEOUT" "$AWS_BIN" ${ep[@]+"${ep[@]}"} "$@"
-            else timeout --kill-after=60 "$CFG_TIMEOUT" "$AWS_BIN" ${ep[@]+"${ep[@]}"} "$@" </dev/null; fi
+            if $stdin; then timeout --foreground --kill-after=60 "$CFG_TIMEOUT" "$AWS_BIN" ${ep[@]+"${ep[@]}"} "$@"
+            else timeout --foreground --kill-after=60 "$CFG_TIMEOUT" "$AWS_BIN" ${ep[@]+"${ep[@]}"} "$@" </dev/null; fi
         else
             if $stdin; then container_run "$CFG_AWS_IMAGE" AWS_ ${ep[@]+"${ep[@]}"} "$@"
             else container_run "$CFG_AWS_IMAGE" AWS_ ${ep[@]+"${ep[@]}"} "$@" </dev/null; fi
@@ -3152,6 +3155,8 @@ cmd_drill() {
 cmd_test() {
     local deep=false rc=0 n
     [[ ${1:-} == --deep ]] && deep=true
+    # a preflight must answer in seconds, not retry for an hour
+    RC_RETRIES=1; RC_LL_RETRIES=2
     resolve_engines
     [[ -n $RCLONE_MODE ]] && ok "rclone v$RCLONE_VER ($RCLONE_MODE${RCLONE_BIN:+: $RCLONE_BIN})"
     [[ -n $AWS_MODE ]] && ok "aws-cli v$AWS_VER ($AWS_MODE${AWS_BIN:+: $AWS_BIN})"
