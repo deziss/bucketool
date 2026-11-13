@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+#  Secrets — never commit a real config, env file or key
+# ---------------------------------------------------------------------------
+s3sync.yml
+s3sync.yaml
+s3sync.json
+s3sync.*.yml
+s3sync.*.yaml
+s3sync.*.json
+!s3sync.example.yml
+!s3sync.example.json
+.env
+.env.*
+*.env
+!*.env.example
+*.key
+*.pem
+*.pass
+*secrets*
+
+# ---------------------------------------------------------------------------
+#  Backup artifacts — they contain production data
+# ---------------------------------------------------------------------------
+*.age
+*.tar.zst
+*.tar.gz
+*.zip
+*.part
+manifest.jsonl.gz
+skipped.jsonl
+SHA256SUMS
+backup/
+backups/
+.cache/
+.tmp/
+.locks/
+reports/
+
+# ---------------------------------------------------------------------------
+#  Logs / editor / OS noise
+# ---------------------------------------------------------------------------
+*.log
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+__pycache__/

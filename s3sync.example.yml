@@ -1,0 +1,120 @@
+# ==========================================================================
+#  s3sync.yml — configuration for s3sync.sh
+#  ${VAR} and ${VAR:-fallback} are expanded from the environment after
+#  env_file is loaded. Keep secrets in the env file, not here.
+# ==========================================================================
+
+env_file: /etc/s3sync/s3sync.env
+
+defaults:
+  backup_dir: /backup/s3            # where backups land (one directory per label)
+  log_file: /var/log/s3sync.log
+  format: snapshot                  # snapshot | tar.zst | tar.gz | zip
+  compression_level: 6              # zstd 1-19, gzip/zip 1-9 (archives)
+  zstd_long: true                   # --long=27: better ratio on big archives
+  cache: keep                       # archives: keep = incremental staging mirror, drop = least disk
+  hash_workers: 4                   # parallel sha256 threads
+  verify: quick                     # after every backup: none | quick | full
+  retention_days: 30                # simple retention ...
+  retention_min_keep: 3             # ... but always keep the N newest good backups
+  # keep_daily: 7                   # GFS retention: any keep_* replaces retention_days
+  # keep_weekly: 4                  #   (ISO weeks)
+  # keep_monthly: 12
+  # keep_yearly: 2
+  transfers: 16                     # parallel downloads
+  checkers: 32
+  bwlimit: ""                       # "50M", or a timetable: "08:00,10M 20:00,off"
+  # max_size: 5G                    # skip objects bigger than this
+  min_free_space: 10%               # refuse to start when the disk would drop below this (or 20G)
+  timeout: 14400                    # seconds per rclone call
+  lock_wait: 3600                   # seconds to wait for another run to finish
+  rclone: auto                      # auto | native | docker
+  # age_identity_file: /etc/s3sync/age.key   # needed to restore / fully verify encrypted archives
+
+notify:
+  webhook: ""                       # POST JSON on failure/warning (and success if on_success)
+  on_success: false
+  healthcheck_url: ""               # healthchecks.io-style: /start, success, /fail
+
+metrics:
+  textfile_dir: ""                  # e.g. /var/lib/node_exporter/textfile_collector
+
+offsite:                            # copy every backup to a second S3 (3-2-1)
+  enabled: false
+  endpoint: offsite_s3
+  bucket: s3-backups
+  prefix: host01
+  retention_days: 90                # archives and manifests; enable bucket versioning for snapshot history
+
+drill:                              # weekly restore drill (systemd/s3sync-verify.timer)
+  target: scratch
+  sources: [media]
+
+# --------------------------------------------------------------------------
+#  Endpoints — S3 servers. A url, or separate fields (fields win).
+# --------------------------------------------------------------------------
+endpoints:
+  minio_prod:
+    url: "https://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio.example.com:9000?provider=Minio&path_style=true"
+
+  aws_main:
+    provider: AWS                   # AWS | Minio | Ceph | Cloudflare | Wasabi | DigitalOcean | Other ...
+    region: ap-south-1
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+    # env_auth: true                # use the instance role / AWS_PROFILE instead of keys
+
+  offsite_s3:
+    provider: Other
+    endpoint: https://s3.backup.example.net
+    access_key_env: OFFSITE_ACCESS_KEY
+    secret_key_env: OFFSITE_SECRET_KEY
+    options:                        # any rclone s3 option, passed through
+      storage_class: STANDARD_IA
+
+# --------------------------------------------------------------------------
+#  Sources — what gets backed up
+# --------------------------------------------------------------------------
+sources:
+  - name: media                     # hardlinked snapshots: unchanged objects cost no extra disk
+    endpoint: minio_prod
+    bucket: media
+    exclude: ["tmp/**", "*.part"]
+
+  - name: invoices                  # one compressed archive per run
+    endpoint: aws_main
+    bucket: acme-invoices
+    prefix: 2026/
+    format: tar.zst
+    compression_level: 9
+    retention_days: 0               # GFS instead:
+    keep_daily: 7
+    keep_monthly: 24
+
+  - name: secrets_vault             # encrypted archive
+    endpoint: minio_prod
+    bucket: vault
+    format: tar.zst
+    encrypt: age
+    age_recipients: ["age1replacewithyourpublickey0000000000000000000000000000000"]
+
+  - name: minio_all                 # every bucket on the server; new buckets are picked up
+    endpoint: minio_prod
+    all_buckets: true
+    exclude_buckets: ["scratch-*", "media", "vault"]   # labels: minio_all_<bucket>
+
+# --------------------------------------------------------------------------
+#  Targets — where restore / drill write
+# --------------------------------------------------------------------------
+targets:
+  minio_dr:
+    endpoint: minio_prod
+    bucket: media-restore
+    create: true                    # create the bucket if missing
+    verify: quick                   # after every restore: none | quick | full
+
+  scratch:
+    endpoint: minio_prod
+    bucket: s3sync-drill
+    create: true
+    scratch: true                   # drills only write to targets marked scratch

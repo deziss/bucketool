@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly s3sync verification and restore drill
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=s3sync-verify.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax
+        run: bash -n s3sync.sh && bash -n install.sh && bash -n tests/e2e.sh
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning --shell=bash s3sync.sh install.sh tests/e2e.sh
+
+      - name: every command referenced is defined
+        run: |
+          rc=0
+          for f in $(grep -oE '\bcmd_[a-z_]+' s3sync.sh | sort -u); do
+            grep -q "^$f()" s3sync.sh || grep -q "^def $f(" s3sync.sh || { echo "::error::$f is called but never defined"; rc=1; }
+          done
+          exit $rc
+
+      - name: no real config or key is tracked
+        run: |
+          bad="$(git ls-files | grep -E '(^|/)s3sync\.(yml|yaml|json)$|\.env$|\.key$|\.age$' | grep -v example || true)"
+          [ -z "$bad" ] || { echo "::error::tracked secret-bearing files: $bad"; exit 1; }
+
+      - name: unit tests (python helper, YAML and JSON examples agree)
+        run: python3 tests/test_py.py
+
+      - name: install.sh installs, updates and never clobbers a config
+        run: |
+          root="$RUNNER_TEMP/inst"; mkdir -p "$root/bin"
+          PREFIX="$root/opt" BIN="$root/bin/s3sync" CONF="$root/etc" ./install.sh
+          "$root/bin/s3sync" --version
+          echo '# MY REAL CONFIG' > "$root/etc/s3sync.yml"
+          printf 'SECRET=keepme\n' > "$root/etc/s3sync.env"
+          PREFIX="$root/opt" BIN="$root/bin/s3sync" CONF="$root/etc" ./install.sh
+          grep -q 'MY REAL CONFIG' "$root/etc/s3sync.yml" || { echo "::error::install.sh overwrote s3sync.yml"; exit 1; }
+          grep -q 'SECRET=keepme' "$root/etc/s3sync.env" || { echo "::error::install.sh overwrote s3sync.env"; exit 1; }
+
+      - name: self-update refuses junk
+        run: |
+          printf 'not a script\n' > "$RUNNER_TEMP/junk.txt"
+          if S3SYNC_UPDATE_URL="file://$RUNNER_TEMP/junk.txt" ./s3sync.sh self-update; then
+            echo "::error::self-update accepted a non-script"; exit 1
+          fi
+          S3SYNC_UPDATE_URL="file://$PWD/s3sync.sh" ./s3sync.sh self-update | grep -q 'already up to date'
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd pigz age
+      - name: rclone
+        run: |
+          v=1.75.2; z=rclone-v$v-linux-amd64.zip
+          curl -fsSLO https://downloads.rclone.org/v$v/$z
+          curl -fsSL https://downloads.rclone.org/v$v/SHA256SUMS | grep " $z\$" | sha256sum -c -
+          unzip -q $z && sudo install -m 0755 rclone-v$v-linux-amd64/rclone /usr/local/bin/rclone
+      - name: end-to-end against MinIO (native rclone)
+        run: tests/e2e.sh
+      - name: end-to-end with the rclone container
+        run: |
+          sudo mv /usr/local/bin/rclone /usr/local/bin/rclone.off
+          tests/e2e.sh

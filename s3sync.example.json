@@ -1,0 +1,119 @@
+{
+  "env_file": "/etc/s3sync/s3sync.env",
+  "defaults": {
+    "backup_dir": "/backup/s3",
+    "log_file": "/var/log/s3sync.log",
+    "format": "snapshot",
+    "compression_level": 6,
+    "zstd_long": true,
+    "cache": "keep",
+    "hash_workers": 4,
+    "verify": "quick",
+    "retention_days": 30,
+    "retention_min_keep": 3,
+    "transfers": 16,
+    "checkers": 32,
+    "bwlimit": "",
+    "min_free_space": "10%",
+    "timeout": 14400,
+    "lock_wait": 3600,
+    "rclone": "auto"
+  },
+  "notify": {
+    "webhook": "",
+    "on_success": false,
+    "healthcheck_url": ""
+  },
+  "metrics": {
+    "textfile_dir": ""
+  },
+  "offsite": {
+    "enabled": false,
+    "endpoint": "offsite_s3",
+    "bucket": "s3-backups",
+    "prefix": "host01",
+    "retention_days": 90
+  },
+  "drill": {
+    "target": "scratch",
+    "sources": [
+      "media"
+    ]
+  },
+  "endpoints": {
+    "minio_prod": {
+      "url": "https://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio.example.com:9000?provider=Minio&path_style=true"
+    },
+    "aws_main": {
+      "provider": "AWS",
+      "region": "ap-south-1",
+      "access_key_env": "AWS_ACCESS_KEY_ID",
+      "secret_key_env": "AWS_SECRET_ACCESS_KEY"
+    },
+    "offsite_s3": {
+      "provider": "Other",
+      "endpoint": "https://s3.backup.example.net",
+      "access_key_env": "OFFSITE_ACCESS_KEY",
+      "secret_key_env": "OFFSITE_SECRET_KEY",
+      "options": {
+        "storage_class": "STANDARD_IA"
+      }
+    }
+  },
+  "sources": [
+    {
+      "name": "media",
+      "endpoint": "minio_prod",
+      "bucket": "media",
+      "exclude": [
+        "tmp/**",
+        "*.part"
+      ]
+    },
+    {
+      "name": "invoices",
+      "endpoint": "aws_main",
+      "bucket": "acme-invoices",
+      "prefix": "2026/",
+      "format": "tar.zst",
+      "compression_level": 9,
+      "retention_days": 0,
+      "keep_daily": 7,
+      "keep_monthly": 24
+    },
+    {
+      "name": "secrets_vault",
+      "endpoint": "minio_prod",
+      "bucket": "vault",
+      "format": "tar.zst",
+      "encrypt": "age",
+      "age_recipients": [
+        "age1replacewithyourpublickey0000000000000000000000000000000"
+      ]
+    },
+    {
+      "name": "minio_all",
+      "endpoint": "minio_prod",
+      "all_buckets": true,
+      "exclude_buckets": [
+        "scratch-*",
+        "media",
+        "vault"
+      ]
+    }
+  ],
+  "targets": {
+    "minio_dr": {
+      "endpoint": "minio_prod",
+      "bucket": "media-restore",
+      "create": true,
+      "verify": "quick"
+    },
+    "scratch": {
+      "endpoint": "minio_prod",
+      "bucket": "s3sync-drill",
+      "create": true,
+      "scratch": true
+    }
+  }
+}

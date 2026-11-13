@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the tag must match the version in the script
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^readonly S3SYNC_VERSION="\([^"]*\)".*/\1/p' s3sync.sh | head -1)"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match S3SYNC_VERSION $ver"; exit 1; }
+
+      - name: sanity checks
+        run: |
+          bash -n s3sync.sh && bash -n install.sh
+          ./s3sync.sh --version && ./s3sync.sh --help > /dev/null
+          python3 tests/test_py.py
+
+      - name: release notes from the changelog
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '$0 ~ "^## " v "( |$)" {inside=1; next} inside && /^## / {exit} inside {print}' CHANGELOG.md > notes.md
+          [ -s notes.md ] || printf 'See [CHANGELOG.md](CHANGELOG.md).\n' > notes.md
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --latest \
+            s3sync.sh install.sh
