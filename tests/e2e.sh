@@ -50,7 +50,7 @@ mc()  { docker run --rm -i --network host --user "$(id -u):$(id -g)" -e HOME=/tm
            -e "MC_HOST_e2e=http://$AK:$SK@127.0.0.1:$PORT" \
            -v "$W/seed:$W/seed" "$MC_IMAGE" "$@"; }
 put_raw() {  # put_raw <bucket> <key-urlencoded> <data>  (keys mc would normalise)
-    curl -fsS -o /dev/null --path-as-is --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" \
+    curl -fsS -o /dev/null --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" \
          -X PUT --data-binary "$3" "http://127.0.0.1:$PORT/$1/$2"
 }
 
