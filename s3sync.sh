@@ -295,6 +295,8 @@ DEFAULTS = {
     'rclone': 'auto',
     'rclone_image': 'rclone/rclone:1.75.2@sha256:2687085f718d3c628f7fdfb77c52a1d344332aed543110bb88088f2c70d43eb5',
     'rclone_flags': [],
+    'engine': 'rclone',
+    'aws_image': 'amazon/aws-cli:2.40.2@sha256:acc32af784911165a8e78b63950625d174ba79b800a66a436c974689c87cd755',
     'encrypt': 'none',
     'age_recipients': [],
     'age_recipients_file': '',
@@ -306,6 +308,7 @@ CHOICES = {
     'cache': ('keep', 'drop'),
     'encrypt': ('none', 'age'),
     'rclone': ('auto', 'native', 'docker'),
+    'engine': ('rclone', 'aws'),
 }
 INTS = ('compression_level', 'hash_workers', 'retention_days', 'retention_min_keep', 'keep_daily',
         'keep_weekly', 'keep_monthly', 'keep_yearly', 'transfers', 'checkers', 'timeout',
@@ -432,7 +435,7 @@ def parse_s3_url(url):
         secure = True if tls is None else as_bool(tls, 'url tls')
     out = {'endpoint': (('https://' if secure else 'http://') + hostport) if hostport else '',
            'access_key': ak, 'secret_key': sk}
-    for k in ('provider', 'region', 'path_style', 'env_auth'):
+    for k in ('provider', 'region', 'path_style', 'env_auth', 'engine'):
         if k in params:
             out[k] = params.pop(k)
     out['options'] = params
@@ -459,10 +462,14 @@ def _secret(e, keys, envkey, filekey):
     return v
 
 
-def build_endpoint(e):
+def build_endpoint(e, default_engine='rclone'):
     base = parse_s3_url(str(e['url'])) if e.get('url') else {'options': {}}
+    engine = str(e.get('engine') or base.get('engine') or default_engine).strip().lower()
+    if engine not in CHOICES['engine']:
+        die('endpoint %s.engine must be rclone or aws (got %r)' % (e['name'], engine))
     ep = {
         'name': e['name'],
+        'engine': engine,
         'provider': str(e.get('provider') or base.get('provider') or 'Other'),
         'endpoint': str(e.get('endpoint') or e.get('endpoint_url') or base.get('endpoint') or ''),
         'region': str(e.get('region') or base.get('region') or ''),
@@ -525,6 +532,16 @@ def emit_endpoint(ep, remote, pfx):
     emit(pfx + 'ID', endpoint_id(ep))
     emit(pfx + 'URL', ep['endpoint'] or '(AWS default endpoint)')
     emit(pfx + 'PROVIDER', ep['provider'])
+    # for the aws-cli engine: plain shell variables, exported only inside its subshell
+    emit(pfx + 'ENGINE', ep['engine'])
+    emit(pfx + 'EPURL', ep['endpoint'])
+    emit(pfx + 'REGION', ep['region'])
+    emit(pfx + 'AK', ep['access_key'])
+    emit(pfx + 'SK', ep['secret_key'])
+    emit(pfx + 'TOKEN', ep['session_token'])
+    emit(pfx + 'ENV_AUTH', ep['env_auth'])
+    ps = ep['path_style']
+    emit(pfx + 'PATH_STYLE', '' if ps in (None, '') else as_bool(ps, 'path_style'))
 
 
 # ---------- sources / targets ----------
@@ -1481,6 +1498,131 @@ def cmd_metrics(bdir):
     print('\n'.join(out))
 
 
+# ---------- aws-cli engine ----------
+def _aws_doc(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read().strip()
+    except OSError:
+        return {}
+    return json.loads(text) if text else {}
+
+
+def aws_selected(key, spec):
+    """aws-cli filter semantics: shell globs on the key relative to the prefix ('*' crosses '/')."""
+    if any(fnmatch.fnmatchcase(key, g) for g in spec.get('exclude') or []):
+        return False
+    inc = spec.get('include') or []
+    return not inc or any(fnmatch.fnmatchcase(key, g) for g in inc)
+
+
+def cmd_aws_listing(raw, out, prefix, spec_json):
+    """list-objects-v2 JSON -> the lsjson shape the engine reads (keys relative to prefix)."""
+    spec = json.loads(spec_json or '{}')
+    prefix = prefix.strip('/')
+    pre = prefix + '/' if prefix else ''
+    maxs = spec.get('max_size')
+    items, toobig = [], []
+    for o in _aws_doc(raw).get('Contents') or []:
+        k = o.get('Key', '')
+        if pre:
+            if not k.startswith(pre):
+                continue
+            k = k[len(pre):]
+        if not k:
+            continue
+        size = int(o.get('Size') or 0)
+        if not aws_selected(k, spec):
+            continue
+        if maxs is not None and size > int(maxs):
+            toobig.append(k)
+            continue
+        if k.endswith('/') and size == 0:
+            items.append({'Path': k.rstrip('/'), 'Size': 0, 'IsDir': True})
+        else:
+            items.append({'Path': k, 'Size': size, 'ModTime': o.get('LastModified', ''), 'IsDir': False,
+                          'Tier': o.get('StorageClass', '')})
+    with open(out, 'w', encoding='utf-8') as fh:
+        json.dump(items, fh, ensure_ascii=False)
+    write_lines(out + '.toobig', toobig)
+
+
+def _aws_escape(k):
+    return ''.join('[%s]' % c if c in '*?[' else c for c in k)
+
+
+def cmd_aws_sync_args(sd, spec_json, toobig, out):
+    """`aws s3 sync` filter arguments that download exactly the objects s3sync expects."""
+    spec = json.loads(spec_json or '{}')
+    args = []
+    if spec.get('include'):
+        args += ['--exclude', '*']
+        for g in spec['include']:
+            args += ['--include', g]
+    for g in spec.get('exclude') or []:
+        args += ['--exclude', g]
+    args += ['--exclude', '*/']                     # folder markers and folder-style keys
+    for s in load_state(sd)['skipped']:
+        args += ['--exclude', _aws_escape(s['k'])]
+    for k in read_lines(toobig):
+        args += ['--exclude', _aws_escape(k)]
+    with open(out, 'wb') as fh:
+        for a in args:
+            fh.write(a.encode('utf-8', 'surrogateescape') + b'\0')
+
+
+def cmd_aws_buckets(raw, out):
+    items = [{'Path': b['Name'], 'Size': -1, 'IsDir': True} for b in _aws_doc(raw).get('Buckets') or []]
+    with open(out, 'w', encoding='utf-8') as fh:
+        json.dump(items, fh)
+
+
+def cmd_aws_prefixes(raw):
+    for p in _aws_doc(raw).get('CommonPrefixes') or []:
+        print(p['Prefix'].rstrip('/').rsplit('/', 1)[-1])
+
+
+def cmd_aws_delete_batches(sel, markers, prefix, outdir):
+    prefix = prefix.strip('/')
+    pre = prefix + '/' if prefix else ''
+    keys = [pre + k for k in read_lines(sel)] + [pre + m for m in read_lines(markers)]
+    os.makedirs(outdir, exist_ok=True)
+    for i in range(0, len(keys), 1000):
+        p = os.path.join(outdir, 'delete-%05d.json' % (i // 1000))
+        with open(p, 'w', encoding='utf-8') as fh:
+            json.dump({'Objects': [{'Key': k} for k in keys[i:i + 1000]], 'Quiet': True}, fh, ensure_ascii=False)
+        print(p)
+
+
+def cmd_stage_sel(src, sel, dest, how):
+    """Selected keys of src under dest: hardlinks (staging for an upload) or real copies (--to-dir)."""
+    import shutil
+    n = 0
+    for k in read_lines(sel):
+        d = _safe_dest(dest, k)
+        if how == 'link':
+            try:
+                os.link(os.path.join(src, k), d)
+                n += 1
+                continue
+            except OSError:
+                pass
+        shutil.copy2(os.path.join(src, k), d)
+        n += 1
+    emit('X_COUNT', n)
+
+
+def cmd_sel_minus(sel, listing, out):
+    have_keys = {it.get('Path') for it in load_listing(listing) if not it.get('IsDir')}
+    keep = [k for k in read_lines(sel) if k not in have_keys]
+    write_lines(out, keep)
+    emit('S_COUNT', len(keep))
+
+
+def cmd_listing_bytes(listing):
+    print(sum(int(it.get('Size') or 0) for it in load_listing(listing) if not it.get('IsDir')))
+
+
 # ---------- main ----------
 def with_cfg(path):
     cfg = load_cfg(path)
@@ -1500,7 +1642,7 @@ def main():
     mode = a[0]
     if mode == 'url':
         ep = build_endpoint(dict(parse_s3_url(a[1]), name='url', url=a[1]))
-        for k in ('provider', 'endpoint', 'region', 'access_key'):
+        for k in ('engine', 'provider', 'endpoint', 'region', 'access_key'):
             print('%-12s %s' % (k, ep[k] or '-'))
         print('%-12s %s' % ('secret_key', '****' if ep['secret_key'] else '-'))
         print('%-12s %s' % ('id', endpoint_id(ep)))
@@ -1508,7 +1650,7 @@ def main():
             print('%-12s %s=%s' % ('option', k, v))
         return
     cfg_modes = ('defaults', 'section', 'names', 'source', 'target', 'endpoint', 'url-endpoint',
-                 'label-policy', 'discover', 'bucket-owner')
+                 'label-policy', 'discover', 'bucket-owner', 'engines')
     if mode in cfg_modes:
         cfg = with_cfg(a[1])
         if mode == 'defaults':
@@ -1527,9 +1669,16 @@ def main():
             for k, v in build_target(cfg, find(cfg, 'targets', a[2])).items():
                 emit(a[3] + k, v)
         elif mode == 'endpoint':
-            emit_endpoint(build_endpoint(find(cfg, 'endpoints', a[2])), a[3], a[4])
+            emit_endpoint(build_endpoint(find(cfg, 'endpoints', a[2]), effective_defaults(cfg)['engine']), a[3], a[4])
         elif mode == 'url-endpoint':
-            emit_endpoint(build_endpoint(dict(parse_s3_url(a[2]), name='url', url=a[2])), a[3], a[4])
+            emit_endpoint(build_endpoint(dict(parse_s3_url(a[2]), name='url', url=a[2]),
+                                         effective_defaults(cfg)['engine']), a[3], a[4])
+        elif mode == 'engines':
+            d = effective_defaults(cfg)['engine']
+            names = set()
+            for e in entries(cfg, 'endpoints'):
+                names.add(str(e.get('engine') or (parse_s3_url(str(e['url'])).get('engine') if e.get('url') else '') or d).lower())
+            print(' '.join(sorted(names or {d})))
         elif mode == 'label-policy':
             cmd_label_policy(cfg, a[2], a[3])
         elif mode == 'discover':
@@ -1561,6 +1710,15 @@ def main():
         'list': lambda: cmd_list(a[1], a[2] if len(a) > 2 else ''),
         'metrics': lambda: cmd_metrics(a[1]),
         'first-key': lambda: print(min(classify(load_listing(a[1]))[0], default='')),
+        'aws-listing': lambda: cmd_aws_listing(a[1], a[2], a[3], a[4]),
+        'aws-sync-args': lambda: cmd_aws_sync_args(a[1], a[2], a[3], a[4]),
+        'aws-buckets': lambda: cmd_aws_buckets(a[1], a[2]),
+        'aws-prefixes': lambda: cmd_aws_prefixes(a[1]),
+        'aws-delete-batches': lambda: cmd_aws_delete_batches(a[1], a[2], a[3], a[4]),
+        'stage-sel': lambda: cmd_stage_sel(a[1], a[2], a[3], a[4]),
+        'sel-minus': lambda: cmd_sel_minus(a[1], a[2], a[3]),
+        'listing-bytes': lambda: cmd_listing_bytes(a[1]),
+        'count': lambda: print(len(load_listing(a[1]))),
     }
     if mode not in handlers:
         die('unknown helper mode %s' % mode)
@@ -1591,6 +1749,9 @@ CONTAINER=""                 # the rclone container currently running, killed on
 RCLONE_MODE=""
 RCLONE_BIN=""
 RCLONE_VER=""
+AWS_MODE=""
+AWS_BIN=""
+AWS_VER=""
 CFG_LOG_FILE=""
 declare -a DOCKER_MOUNTS=()
 declare -A LOCK_FDS=()
@@ -1750,7 +1911,7 @@ resolve_rclone() {
         docker pull -q "$CFG_RCLONE_IMAGE" >/dev/null || die "cannot pull $CFG_RCLONE_IMAGE"
     fi
     RCLONE_MODE=docker
-    RCLONE_VER="$(rclone_exec version | sed -n '1s/^rclone v\([0-9.]*\).*/\1/p')"
+    RCLONE_VER="$(docker run --rm "$CFG_RCLONE_IMAGE" version 2>/dev/null | sed -n '1s/^rclone v\([0-9.]*\).*/\1/p')"
 }
 
 rclone_exec() {  # rclone with no extra flags; stdout passes through, stdin only for rcat
@@ -1760,21 +1921,12 @@ rclone_exec() {  # rclone with no extra flags; stdout passes through, stdin only
 }
 
 rclone_exec_in() {
+    [[ -n $RCLONE_MODE ]] || resolve_rclone
     if [[ $RCLONE_MODE == native ]]; then
         timeout --kill-after=60 "$CFG_TIMEOUT" "$RCLONE_BIN" "$@"
-        return
+    else
+        container_run "$CFG_RCLONE_IMAGE" RCLONE_ "$@"
     fi
-    local -a envs=() mounts=() m v
-    for v in $(compgen -e); do [[ $v == RCLONE_* ]] && envs+=(-e "$v"); done
-    mounts=(--mount "type=bind,src=$CFG_BACKUP_DIR,dst=$CFG_BACKUP_DIR")
-    for m in ${DOCKER_MOUNTS[@]+"${DOCKER_MOUNTS[@]}"}; do mounts+=(--mount "type=bind,src=$m,dst=$m"); done
-    CONTAINER="s3sync-$$-$RANDOM"
-    local rc=0
-    timeout --kill-after=60 "$CFG_TIMEOUT" docker run --rm -i --init --pull never --name "$CONTAINER" \
-        --network host --user "$(id -u):$(id -g)" -e HOME=/tmp "${envs[@]}" "${mounts[@]}" \
-        -w "$CFG_BACKUP_DIR" "$CFG_RCLONE_IMAGE" "$@" || rc=$?
-    (( rc == 0 )) && CONTAINER="" || kill_container   # a timeout kills the client, not the container
-    return $rc
 }
 
 # rclone with the run's transfer settings; stderr is kept for error summaries
@@ -1796,6 +1948,315 @@ use_endpoint() {  # use_endpoint <endpoint-name> <REMOTE> <PFX>
     local v r="RCLONE_CONFIG_${2^^}_"
     for v in $(compgen -e); do [[ $v == "$r"* ]] && unset "$v"; done
     cfg_eval endpoint "$CONFIG" "$1" "$2" "$3"
+}
+
+# ===========================================================================
+#  Containers (rclone and aws-cli images): backup_dir is bind-mounted at the
+#  same path, so every file handed over lives below it.
+# ===========================================================================
+container_run() {  # container_run <image> <env-prefix> args...
+    local image="$1" envp="$2"; shift 2
+    local -a envs=() mounts=() m v
+    for v in $(compgen -e); do [[ $v == "$envp"* ]] && envs+=(-e "$v"); done
+    mounts=(--mount "type=bind,src=$CFG_BACKUP_DIR,dst=$CFG_BACKUP_DIR")
+    for m in ${DOCKER_MOUNTS[@]+"${DOCKER_MOUNTS[@]}"}; do mounts+=(--mount "type=bind,src=$m,dst=$m"); done
+    CONTAINER="s3sync-$$-$RANDOM"
+    local rc=0
+    timeout --kill-after=60 "$CFG_TIMEOUT" docker run --rm -i --init --pull never --name "$CONTAINER" \
+        --network host --user "$(id -u):$(id -g)" -e HOME=/tmp ${envs[@]+"${envs[@]}"} "${mounts[@]}" \
+        -w "$CFG_BACKUP_DIR" "$image" "$@" || rc=$?
+    if (( rc == 0 )); then CONTAINER=""; else kill_container; fi   # a timeout kills the client, not the container
+    return $rc
+}
+
+# ===========================================================================
+#  aws-cli engine (endpoint or defaults `engine: aws`)
+# ===========================================================================
+resolve_aws() {
+    [[ -n $AWS_MODE ]] && return 0
+    local v
+    if [[ $CFG_RCLONE != docker ]] && have aws; then
+        v="$(aws --version 2>/dev/null | sed -n 's#^aws-cli/\([0-9.]*\).*#\1#p')"
+        if [[ -n $v ]] && version_ge "$v" 2.0.0; then AWS_MODE=native; AWS_BIN="$(command -v aws)"; AWS_VER="$v"; return 0; fi
+        [[ -n $v ]] && warn "ignoring aws-cli v$v: v2 is required"
+    fi
+    have docker && docker info >/dev/null 2>&1 || die "engine aws needs aws-cli v2 or docker"
+    if ! docker image inspect "$CFG_AWS_IMAGE" >/dev/null 2>&1; then
+        log "pulling $CFG_AWS_IMAGE"
+        docker pull -q "$CFG_AWS_IMAGE" >/dev/null || die "cannot pull $CFG_AWS_IMAGE"
+    fi
+    AWS_MODE=docker
+    AWS_VER="$(docker run --rm "$CFG_AWS_IMAGE" --version 2>/dev/null | sed -n 's#^aws-cli/\([0-9.]*\).*#\1#p')"
+}
+
+aws_bw() {  # rclone-style bwlimit -> aws max_bandwidth ('' if not expressible)
+    local b="${1^^}"
+    [[ -z $b ]] && return 0
+    if [[ $b =~ ^([0-9]+)([KMG]?)$ ]]; then printf '%s%sB/s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else warn "bwlimit '$1' (timetable) is not supported by the aws engine — running unlimited"; fi
+}
+
+aws_exec() {  # aws_exec <role> [--stdin] args...   credentials exported only inside a subshell
+    local role="$1"; shift
+    local stdin=false
+    [[ ${1:-} == --stdin ]] && { stdin=true; shift; }
+    resolve_aws
+    local p cfgf ps bw ep_url
+    p="$(role_pfx "$role")"; cfgf="$RUNDIR/aws-$role.cfg"; ps="$(gv "${p}PATH_STYLE")"
+    bw="$(aws_bw "${X_BWLIMIT:-$CFG_BWLIMIT}")"; ep_url="$(gv "${p}EPURL")"
+    {
+        echo '[default]'
+        echo 's3 ='
+        echo "    max_concurrent_requests = ${X_TRANSFERS:-$CFG_TRANSFERS}"
+        if [[ $ps == true || ( -z $ps && $(gv "${p}PROVIDER") != AWS ) ]]; then echo '    addressing_style = path'; fi
+        [[ -n $bw ]] && echo "    max_bandwidth = $bw"
+    } >"$cfgf"
+    local -a ep=()
+    [[ -n $ep_url ]] && ep=(--endpoint-url "$ep_url")
+    (
+        trap kill_container EXIT
+        local v
+        if [[ $(gv "${p}ENV_AUTH") != true ]]; then
+            for v in $(compgen -e); do [[ $v == AWS_* ]] && unset "$v"; done
+            AWS_ACCESS_KEY_ID="$(gv "${p}AK")"; AWS_SECRET_ACCESS_KEY="$(gv "${p}SK")"
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SHARED_CREDENTIALS_FILE=/dev/null
+            if [[ -n $(gv "${p}TOKEN") ]]; then AWS_SESSION_TOKEN="$(gv "${p}TOKEN")"; export AWS_SESSION_TOKEN; fi
+        fi
+        AWS_DEFAULT_REGION="$(gv "${p}REGION")"
+        export AWS_CONFIG_FILE="$cfgf" AWS_PAGER="" AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+        # aws-cli >= 2.23 sends CRC checksums by default, which many S3-compatible servers reject
+        export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+        if [[ $AWS_MODE == native ]]; then
+            if $stdin; then timeout --kill-after=60 "$CFG_TIMEOUT" "$AWS_BIN" ${ep[@]+"${ep[@]}"} "$@"
+            else timeout --kill-after=60 "$CFG_TIMEOUT" "$AWS_BIN" ${ep[@]+"${ep[@]}"} "$@" </dev/null; fi
+        else
+            if $stdin; then container_run "$CFG_AWS_IMAGE" AWS_ ${ep[@]+"${ep[@]}"} "$@"
+            else container_run "$CFG_AWS_IMAGE" AWS_ ${ep[@]+"${ep[@]}"} "$@" </dev/null; fi
+        fi
+    )
+}
+
+aws_run() {  # aws_run <role> args...   stderr kept for error summaries
+    : >"$RUNDIR/rclone.err"
+    if $VERBOSE; then aws_exec "$@" 2> >(tee "$RUNDIR/rclone.err" >&2)
+    else aws_exec "$@" 2>"$RUNDIR/rclone.err"; fi
+}
+
+aws_s3() {  # aws_s3 <role> <s3-subcommand> args...
+    local role="$1" sub="$2"; shift 2
+    local -a q=()
+    case "$sub" in
+        cp|sync|mv) q=(--only-show-errors --no-progress) ;;
+        rm)         q=(--only-show-errors) ;;
+    esac
+    aws_run "$role" s3 "$sub" "$@" ${q[@]+"${q[@]}"}
+}
+
+# ===========================================================================
+#  S3 operations — one function per operation, rclone or aws-cli per endpoint.
+#  A location is <role> <bucket> <prefix>; roles: SRC, DST (targets), OFF.
+# ===========================================================================
+gv() { eval "printf '%s' \"\${$1-}\""; }
+role_pfx() { case "$1" in SRC) echo SEP_ ;; DST) echo DEP_ ;; OFF) echo OEP_ ;; *) die "bad role $1" ;; esac; }
+eng() { local e; e="$(gv "$(role_pfx "$1")ENGINE")"; printf '%s' "${e:-rclone}"; }
+rpath() { printf '%s:%s%s' "$1" "$2" "${3:+/$3}"; }
+s3url() { printf 's3://%s/%s' "$1" "${2:+$2/}"; }
+joinp() { local a="${1%/}" b="${2#/}"; printf '%s' "${a:+$a${b:+/}}$b"; }
+
+aws_spec() {  # the source's filters as JSON for the aws engine
+    local mx=""
+    [[ -n ${SRC_MAX_SIZE:-} ]] && mx="$(to_bytes "$SRC_MAX_SIZE")"
+    python3 -c 'import json,sys
+a=sys.argv[1:]; i=a.index("--"); j=a.index("--", i + 1)
+print(json.dumps({"max_size": int(a[0]) if a[0] not in ("", "-1") else None, "include": a[1:i], "exclude": a[i+1:j]}))' \
+        "$mx" ${SRC_INCLUDE[@]+"${SRC_INCLUDE[@]}"} -- ${SRC_EXCLUDE[@]+"${SRC_EXCLUDE[@]}"} --
+}
+
+s3_list() {  # s3_list <role> <bucket> <prefix> <out> [filtered] -> lsjson-shaped file, keys relative to prefix
+    local role="$1" b="$2" pre="$3" out="$4" filtered="${5:-}"
+    if [[ $(eng "$role") == aws ]]; then
+        local -a pa=()
+        [[ -n $pre ]] && pa=(--prefix "$pre/")
+        aws_run "$role" s3api list-objects-v2 --bucket "$b" ${pa[@]+"${pa[@]}"} --output json >"$out.raw" || return 1
+        local spec='{}'
+        [[ -n $filtered ]] && spec="$(aws_spec)"
+        cfgpy aws-listing "$out.raw" "$out" "$pre" "$spec"
+    else
+        local -a f=()
+        [[ -n $filtered ]] && f=(${FILT[@]+"${FILT[@]}"})
+        rclone_run lsjson -R --fast-list --use-server-modtime --no-mimetype ${f[@]+"${f[@]}"} "$(rpath "$role" "$b" "$pre")" >"$out"
+    fi
+}
+
+s3_download() {  # s3_download <role> <bucket> <prefix> <data-dir> <keys-file> <state-dir>
+    local role="$1" b="$2" pre="$3" data="$4" keys="$5" sd="$6"
+    if [[ $(eng "$role") == aws ]]; then
+        # everything already on disk is current (reconcile unlinked the rest), so a
+        # sync downloads exactly the missing objects; s3transfer writes temp files
+        # and renames them, which never touches a hardlinked inode
+        cfgpy aws-sync-args "$sd" "$(aws_spec)" "$sd/listing.json.toobig" "$sd/aws.args" || return 1
+        local -a xa=()
+        mapfile -d '' -t xa <"$sd/aws.args"
+        aws_s3 "$role" sync "$(s3url "$b" "$pre")" "$data" ${xa[@]+"${xa[@]}"}
+    else
+        rclone_run copy --files-from-raw "$keys" --no-check-dest --fast-list --use-server-modtime \
+            "$(rpath "$role" "$b" "$pre")" "$data"
+    fi
+}
+
+s3_buckets() {  # s3_buckets <role> <out>  -> lsjson-shaped list of buckets
+    if [[ $(eng "$1") == aws ]]; then
+        aws_run "$1" s3api list-buckets --output json >"$2.raw" && cfgpy aws-buckets "$2.raw" "$2"
+    else
+        rclone_run lsjson --dirs-only "$1:" >"$2"
+    fi
+}
+
+s3_bucket_exists() {  # s3_bucket_exists <role> <bucket>
+    if [[ $(eng "$1") == aws ]]; then aws_run "$1" s3api head-bucket --bucket "$2" >/dev/null 2>&1
+    else rclone_run lsf --max-depth 1 "$1:$2" >/dev/null 2>&1; fi
+}
+
+s3_peek() {  # s3_peek <role> <bucket> <prefix>: can we list it at all?
+    if [[ $(eng "$1") == aws ]]; then
+        local -a pa=()
+        [[ -n $3 ]] && pa=(--prefix "$3/")
+        aws_run "$1" s3api list-objects-v2 --bucket "$2" ${pa[@]+"${pa[@]}"} --max-items 1 >/dev/null
+    else rclone_run lsf --max-depth 1 "$(rpath "$1" "$2" "$3")" >/dev/null; fi
+}
+
+s3_is_empty() {  # s3_is_empty <role> <bucket> <prefix>  (status 0 when no objects, or no bucket yet)
+    s3_bucket_exists "$1" "$2" || return 0
+    if [[ $(eng "$1") == aws ]]; then
+        local -a pa=()
+        [[ -n $3 ]] && pa=(--prefix "$3/")
+        [[ "$(aws_run "$1" s3api list-objects-v2 --bucket "$2" ${pa[@]+"${pa[@]}"} --max-items 1 \
+              --query 'Contents[0].Key' --output text 2>/dev/null)" == None ]]
+    else
+        [[ -z $(rclone_run lsf -R --files-only --max-depth 50 "$(rpath "$1" "$2" "$3")" 2>/dev/null | head -1) ]]
+    fi
+}
+
+s3_mkbucket() {  # s3_mkbucket <role> <bucket>
+    if [[ $(eng "$1") == aws ]]; then aws_s3 "$1" mb "s3://$2"
+    else rclone_run mkdir "$1:$2"; fi
+}
+
+s3_upload() {  # s3_upload <role> <src-dir> <sel> <bucket> <prefix> <merge|skip-existing|mirror> <scope>
+    local role="$1" src="$2" sel="$3" b="$4" pre="$5" mode="$6" scope="$7"
+    if [[ $(eng "$role") == aws ]]; then
+        local stage="$RUNDIR/upload" use="$sel"
+        rm -rf "$stage"; mkdir -p "$stage"
+        if [[ $mode == skip-existing ]]; then
+            s3_list "$role" "$b" "$pre" "$RUNDIR/upload-existing.json" || return 1
+            cfg_eval sel-minus "$sel" "$RUNDIR/upload-existing.json" "$RUNDIR/upload.sel"
+            use="$RUNDIR/upload.sel"
+        fi
+        cfg_eval stage-sel "$src" "$use" "$stage" link
+        case "$mode" in
+            mirror) aws_s3 "$role" sync "$(joinp "$stage" "$scope")" "$(s3url "$b" "$(joinp "$pre" "$scope")")" --delete ;;
+            *)      (( X_COUNT == 0 )) || aws_s3 "$role" cp --recursive "$stage" "$(s3url "$b" "$pre")" ;;
+        esac
+    else
+        local dest; dest="$(rpath "$role" "$b" "$pre")"
+        case "$mode" in
+            mirror) rclone_run sync "$(joinp "$src" "$scope")" "$(joinp "$dest" "$scope")" --s3-no-check-bucket ;;
+            skip-existing) rclone_run copy --ignore-existing --files-from-raw "$sel" --s3-no-check-bucket "$src" "$dest" ;;
+            *) rclone_run copy --files-from-raw "$sel" --s3-no-check-bucket "$src" "$dest" ;;
+        esac
+    fi
+}
+
+s3_marker() {  # s3_marker <role> <bucket> <prefix> <marker/>
+    if [[ $(eng "$1") == aws ]]; then aws_run "$1" s3api put-object --bucket "$2" --key "$(joinp "$3" "$4")" >/dev/null
+    else rclone_run mkdir --s3-directory-markers "$(rpath "$1" "$2" "$3")/${4%/}"; fi
+}
+
+s3_delete_sel() {  # s3_delete_sel <role> <bucket> <prefix> <sel> <markers-file>
+    local role="$1" b="$2" pre="$3" sel="$4" markers="$5" f
+    if [[ $(eng "$role") == aws ]]; then
+        local rc=0
+        while IFS= read -r f; do
+            aws_run "$role" s3api delete-objects --bucket "$b" --delete "file://$f" >/dev/null || rc=1
+        done < <(cfgpy aws-delete-batches "$sel" "$markers" "$pre" "$RUNDIR/delete")
+        return $rc
+    fi
+    if [[ -s $sel ]]; then rclone_run delete --files-from-raw "$sel" "$(rpath "$role" "$b" "$pre")" || return 1; fi
+    rclone_run rmdirs --s3-directory-markers --leave-root "$(rpath "$role" "$b" "$pre")" 2>/dev/null || true
+}
+
+s3_check_full() {  # s3_check_full <role> <bucket> <prefix> <local-dir> <sel> <backup-dir>: byte-level check
+    local role="$1" b="$2" pre="$3" local_dir="$4" sel="$5" bk="$6"
+    if [[ $(eng "$role") == aws ]]; then
+        local tmp="$RUNDIR/check"
+        rm -rf "$tmp"; mkdir -p "$tmp"
+        disk_guard "$CFG_BACKUP_DIR" "$(cfgpy listing-bytes "$RUNDIR/target.json")" 0 "downloading the target for a full check" || return 1
+        aws_s3 "$role" sync "$(s3url "$b" "$pre")" "$tmp" || return 1
+        cfgpy verify-tree "$bk" "$tmp" 1 "$CFG_HASH_WORKERS" "" "$sel" ""
+        local rc=$?
+        rm -rf "$tmp"
+        return $rc
+    fi
+    rclone_run check --download --one-way --files-from-raw "$sel" "$local_dir" "$(rpath "$role" "$b" "$pre")"
+}
+
+s3_read_one() {  # s3_read_one <role> <bucket> <prefix> <key>
+    if [[ $(eng "$1") == aws ]]; then
+        aws_run "$1" s3api head-object --bucket "$2" --key "$(joinp "$3" "$4")" >/dev/null
+    else rclone_run cat --count 1 "$(rpath "$1" "$2" "$3")/$4" >/dev/null; fi
+}
+
+s3_write_probe() {  # s3_write_probe <role> <bucket> <prefix>
+    local key; key="$(joinp "$3" ".s3sync-probe-$$")"
+    if [[ $(eng "$1") == aws ]]; then
+        echo probe | aws_run "$1" --stdin s3 cp - "s3://$2/$key" --only-show-errors && aws_s3 "$1" rm "s3://$2/$key"
+    else
+        echo probe | rclone_run rcat "$1:$2/$key" && rclone_run deletefile "$1:$2/$key"
+    fi
+}
+
+s3_versioning() {  # s3_versioning <role> <bucket> -> Enabled | Suspended | ...
+    if [[ $(eng "$1") == aws ]]; then aws_run "$1" s3api get-bucket-versioning --bucket "$2" --query Status --output text 2>/dev/null
+    else rclone_run backend versioning "$1:$2" 2>/dev/null; fi
+}
+
+s3_put_dir() {  # s3_put_dir <role> <local-dir> <bucket> <prefix> [exclude-data]
+    if [[ $(eng "$1") == aws ]]; then
+        local -a x=()
+        [[ -n ${5:-} ]] && x=(--exclude 'data/*')
+        aws_s3 "$1" cp --recursive "$2" "$(s3url "$3" "$4")" ${x[@]+"${x[@]}"}
+    else
+        local -a x=()
+        [[ -n ${5:-} ]] && x=(--filter "- data/**")
+        rclone_run copy "$2" "$(rpath "$1" "$3" "$4")" ${x[@]+"${x[@]}"}
+    fi
+}
+
+s3_subdirs() {  # s3_subdirs <role> <bucket> <prefix>  -> immediate "folder" names
+    if [[ $(eng "$1") == aws ]]; then
+        aws_run "$1" s3api list-objects-v2 --bucket "$2" --prefix "$3/" --delimiter / --output json >"$RUNDIR/dirs.raw" \
+            && cfgpy aws-prefixes "$RUNDIR/dirs.raw"
+    else
+        rclone_run lsf --dirs-only "$(rpath "$1" "$2" "$3")" 2>/dev/null | sed 's#/$##'
+    fi
+}
+
+s3_purge() {  # s3_purge <role> <bucket> <prefix>
+    if [[ $(eng "$1") == aws ]]; then aws_s3 "$1" rm --recursive "$(s3url "$2" "$3")"
+    else rclone_run purge "$(rpath "$1" "$2" "$3")"; fi
+}
+
+engine_version() {  # engine_version <role>
+    if [[ $(eng "$1") == aws ]]; then resolve_aws; printf 'aws-cli %s' "$AWS_VER"
+    else resolve_rclone; printf 'rclone %s' "$RCLONE_VER"; fi
+}
+
+# pre-resolve the engines the config uses, so subshells do not each probe them
+resolve_engines() {
+    local e
+    for e in $(cfgpy engines "$CONFIG"); do
+        case "$e" in rclone) resolve_rclone ;; aws) resolve_aws ;; esac
+    done
 }
 
 # ===========================================================================
@@ -1966,7 +2427,7 @@ verify_backup() {  # verify_backup <backup-dir> <none|quick|full> [report-file] 
 # ===========================================================================
 #  BACKUP
 # ===========================================================================
-src_path() { printf 'SRC:%s%s' "$1" "${SRC_PREFIX:+/$SRC_PREFIX}"; }
+src_path() { printf '%s/%s%s' "$SEP_URL" "$1" "${SRC_PREFIX:+/$SRC_PREFIX}"; }   # for messages
 
 filter_flags() {  # rclone filter flags from the source's include/exclude
     FILT=()
@@ -2007,6 +2468,7 @@ backup_label() {  # backup_label <source-name> <bucket> <label>   (SRC_* loaded;
     local name="$1" bucket="$2" label="$3" t0=$SECONDS
     local ldir="$CFG_BACKUP_DIR/$label" work="$RUNDIR/$label" ts prev prevman="" prevdata="" data mode
     local srcpath; srcpath="$(src_path "$bucket")"
+    local engine; engine="$(eng SRC)"
     X_TRANSFERS="$SRC_TRANSFERS"; X_CHECKERS="$SRC_CHECKERS"; X_BWLIMIT="$SRC_BWLIMIT"
     lock "label-$label" exclusive
     mkdir -p "$ldir" "$work"
@@ -2016,9 +2478,9 @@ backup_label() {  # backup_label <source-name> <bucket> <label>   (SRC_* loaded;
 
     # 1. list once — no per-object HEAD requests
     filter_flags
-    log "$label: listing $srcpath"
-    rclone_run lsjson -R --fast-list --use-server-modtime --no-mimetype ${FILT[@]+"${FILT[@]}"} "$srcpath" \
-        >"$work/listing.json" || die "$label: listing $srcpath failed: $(rclone_err)"
+    log "$label: listing $srcpath ($engine)"
+    s3_list SRC "$bucket" "$SRC_PREFIX" "$work/listing.json" filtered \
+        || die "$label: listing $srcpath failed: $(rclone_err)"
 
     # 2. what changed since the last good backup
     prev="$(cfgpy pick "$ldir" good)"
@@ -2051,21 +2513,19 @@ backup_label() {  # backup_label <source-name> <bucket> <label>   (SRC_* loaded;
     # 5. download exactly what is missing (unlinked first, so older snapshots are never written)
     if (( R_DL_COUNT > 0 )); then
         log "$label: downloading $R_DL_COUNT object(s), $(human "$R_DL_BYTES")"
-        rclone_run copy --files-from-raw "$work/delta.txt" --no-check-dest --fast-list --use-server-modtime \
-            "$srcpath" "$data" || warn "$label: some transfers failed ($(rclone_err)) — checking what arrived"
+        s3_download SRC "$bucket" "$SRC_PREFIX" "$data" "$work/delta.txt" "$work" \
+            || warn "$label: some transfers failed ($(rclone_err)) — checking what arrived"
     fi
 
     # 6. completeness gate: exactly the expected (key, size) set
     cfg_eval gate "$work" "$data" ""
     if (( G_MISMATCH > 0 )); then
         log "$label: $G_MISMATCH object(s) incomplete — retrying"
-        rclone_run copy --files-from-raw "$work/mismatch.txt" --no-check-dest --fast-list --use-server-modtime \
-            "$srcpath" "$data" || true
+        s3_download SRC "$bucket" "$SRC_PREFIX" "$data" "$work/mismatch.txt" "$work" || true
         cfg_eval gate "$work" "$data" ""
     fi
     if (( G_MISMATCH > 0 )); then
-        rclone_run lsjson -R --files-only --fast-list --use-server-modtime --no-mimetype \
-            --files-from-raw "$work/mismatch.txt" "$srcpath" >"$work/relist.json" \
+        s3_list SRC "$bucket" "$SRC_PREFIX" "$work/relist.json" filtered \
             || die "$label: cannot re-list incomplete objects: $(rclone_err)"
         cfg_eval gate "$work" "$data" "$work/relist.json"
         (( G_DROPPED > 0 )) && warn "$label: $G_DROPPED object(s) changed or vanished on the source during the backup (see skipped.jsonl)"
@@ -2099,7 +2559,7 @@ backup_label() {  # backup_label <source-name> <bucket> <label>   (SRC_* loaded;
         "finished=$(now_utc)" "finished_epoch=$(date +%s)" "duration_s=$(( SECONDS - t0 ))" \
         "objects=$F_OBJECTS" "bytes=$F_BYTES" "markers=$F_MARKERS" "new=$F_NEW" "changed=$F_CHANGED" \
         "deleted=$F_DELETED" "unchanged=$F_UNCHANGED" "skipped=$F_SKIPPED" "unique_bytes=$F_UNIQUE" \
-        "archive_bytes=$archive_bytes" "rclone=$RCLONE_VER" "verify=pending" "offsite="
+        "archive_bytes=$archive_bytes" "engine=$(engine_version SRC)" "verify=pending" "offsite="
     sync -f "$b" 2>/dev/null || true
     rm -f "$ldir/.redownload"
     [[ $mode == cache && $SRC_CACHE == drop ]] && rm -rf "$CFG_BACKUP_DIR/.cache/$label"
@@ -2128,7 +2588,7 @@ backup_source() {  # backup_source <source-name>   (one subshell per label)
     use_endpoint "$SRC_ENDPOINT" SRC SEP_
     local -a buckets=()
     if [[ $SRC_ALL_BUCKETS == true ]]; then
-        rclone_run lsjson --dirs-only "SRC:" >"$RUNDIR/buckets.json" \
+        s3_buckets SRC "$RUNDIR/buckets.json" \
             || { err "$name: cannot list buckets: $(rclone_err)"; worst 1; return; }
         mapfile -t buckets < <(cfgpy buckets "$RUNDIR/buckets.json" \
             "$(python3 -c 'import json,sys;print(json.dumps({"include":sys.argv[1:sys.argv.index("--")],"exclude":sys.argv[sys.argv.index("--")+1:]}))' \
@@ -2157,7 +2617,7 @@ cmd_backup() {
     else IFS=',' read -r -a names <<<"$sel"; fi
     (( ${#names[@]} )) || die "no enabled sources in $CONFIG"
     lock global shared
-    resolve_rclone
+    resolve_engines
     hc_start
     : >"$RUNDIR/results.tsv"
     for n in "${names[@]}"; do backup_source "$n"; done
@@ -2178,7 +2638,7 @@ print(json.dumps({"status":int(sys.argv[2]),"results":[{"label":a,"status":int(b
 # ===========================================================================
 #  OFFSITE
 # ===========================================================================
-offsite_base() { printf 'OFF:%s/%s%s' "$OFFSITE_BUCKET" "${OFFSITE_PREFIX:+$OFFSITE_PREFIX/}" "$1"; }
+offsite_base() { printf '%s%s' "${OFFSITE_PREFIX:+$OFFSITE_PREFIX/}" "$1"; }   # key prefix inside OFFSITE_BUCKET
 
 offsite_push() {  # offsite_push <label> <backup-dir> <previous-backup-dir>
     local label="$1" b="$2" prev="$3" ts fmt base state last=""
@@ -2186,24 +2646,32 @@ offsite_push() {  # offsite_push <label> <backup-dir> <previous-backup-dir>
     ts="$(basename "$b")"; fmt="$(cfgpy meta-get "$b" format)"; base="$(offsite_base "$label")"
     state="$CFG_BACKUP_DIR/$label/.offsite"
     [[ -f $state ]] && last="$(<"$state")"
+    if ! s3_bucket_exists OFF "$OFFSITE_BUCKET"; then
+        s3_mkbucket OFF "$OFFSITE_BUCKET" || return 1
+        log "created off-site bucket $OFFSITE_BUCKET"
+    fi
     if [[ $fmt == snapshot ]]; then
-        local work="$RUNDIR/$label"
-        if [[ -n $prev && $last == "$(basename "$prev")" && -f $work/changed.txt ]]; then
+        local work="$RUNDIR/$label" cur
+        cur="$(rpath OFF "$OFFSITE_BUCKET" "$base/current")"
+        if [[ $(eng OFF) == aws ]]; then
+            log "$label: off-site: syncing current/ (aws)"
+            aws_s3 OFF sync "$b/data" "$(s3url "$OFFSITE_BUCKET" "$base/current")" --delete || return 1
+        elif [[ -n $prev && $last == "$(basename "$prev")" && -f $work/changed.txt ]]; then
             log "$label: off-site: $(wc -l <"$work/changed.txt") changed, $(wc -l <"$work/deleted.txt") deleted"
             if [[ -s $work/changed.txt ]]; then
-                rclone_run copy --files-from-raw "$work/changed.txt" --no-check-dest "$b/data" "$base/current" || return 1
+                rclone_run copy --files-from-raw "$work/changed.txt" --no-check-dest "$b/data" "$cur" || return 1
             fi
             if [[ -s $work/deleted.txt ]]; then
-                rclone_run delete --files-from-raw "$work/deleted.txt" "$base/current" || return 1
+                rclone_run delete --files-from-raw "$work/deleted.txt" "$cur" || return 1
             fi
         else
             log "$label: off-site: full sync of current/ (first run, or off-site out of step)"
-            rclone_run sync "$b/data" "$base/current" || return 1
+            rclone_run sync "$b/data" "$cur" || return 1
         fi
-        rclone_run copy "$b" "$base/manifests/$ts" --filter "- data/**" || return 1
+        s3_put_dir OFF "$b" "$OFFSITE_BUCKET" "$base/manifests/$ts" exclude-data || return 1
         printf '%s\n' "$ts" >"$state"
     else
-        rclone_run copy "$b" "$base/$ts" || return 1
+        s3_put_dir OFF "$b" "$OFFSITE_BUCKET" "$base/$ts" || return 1
     fi
     cfgpy meta-set "$b/meta.json" "offsite=$(now_utc)"
     ok "$label: off-site copy done"
@@ -2218,13 +2686,14 @@ offsite_prune() {  # offsite_prune <label>   (archives and manifests older than 
     local sub
     for sub in "" "manifests/"; do
         local -a dirs=()
-        mapfile -t dirs < <(rclone_run lsf --dirs-only "$base/$sub" 2>/dev/null | sed 's#/$##' | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort)
+        mapfile -t dirs < <(s3_subdirs OFF "$OFFSITE_BUCKET" "$base${sub:+/${sub%/}}" 2>/dev/null | grep -E '^[0-9]{8}T[0-9]{6}Z$' | sort)
         local n=${#dirs[@]} i
         for (( i = 0; i < n - 1; i++ )); do       # never the newest
             d="${dirs[$i]}"
             [[ $d < $cutoff ]] || continue
-            if $DRY_RUN; then log "would delete off-site $base/$sub$d"; continue; fi
-            rclone_run purge "$base/$sub$d" && log "$label: off-site: removed $sub$d" || warn "$label: off-site: cannot remove $sub$d"
+            if $DRY_RUN; then log "would delete off-site $OFFSITE_BUCKET/$base/$sub$d"; continue; fi
+            if s3_purge OFF "$OFFSITE_BUCKET" "$base/$sub$d"; then log "$label: off-site: removed $sub$d"
+            else warn "$label: off-site: cannot remove $sub$d"; fi
         done
     done
 }
@@ -2258,7 +2727,6 @@ prune_all() {
             if $DRY_RUN; then log "would remove stale $(basename "$p")"; else rm -rf "$p"; log "removed stale $lab/$(basename "$p")"; fi
         done
         if [[ $OFFSITE_ENABLED == true ]] && ! $NO_OFFSITE; then
-            resolve_rclone
             offsite_prune "$lab" || warn "$lab: off-site prune failed"
         fi
     done
@@ -2322,7 +2790,6 @@ cmd_verify() {
         if verify_backup "$b" "$level" "$rep"; then ok "$lab/$(basename "$b"): $level verification passed"
         else err "$lab/$(basename "$b"): verification FAILED (report: $rep)"; rc=1; fi
         if [[ -n $target ]]; then
-            resolve_rclone
             local sel="$RUNDIR/sel.txt"
             cfg_eval select "$b/manifest.jsonl.gz" "" "$sel"
             verify_target "$b" "$target" "$sel" "$level" "$b/data" || rc=1
@@ -2335,7 +2802,7 @@ cmd_verify() {
 # ===========================================================================
 #  RESTORE / DRILL
 # ===========================================================================
-target_root() { printf 'DST:%s%s' "$TGT_BUCKET" "${TGT_PREFIX:+/$TGT_PREFIX}"; }
+target_root() { printf '%s/%s%s' "$DEP_URL" "$TGT_BUCKET" "${TGT_PREFIX:+/$TGT_PREFIX}"; }   # for messages
 
 load_target() {  # load_target <name> -> TGT_*, DST remote, DEP_*
     cfg_eval target "$CONFIG" "$1" TGT_
@@ -2346,13 +2813,13 @@ verify_target() {  # verify_target <backup-dir> <target> <sel-file> <quick|full>
     local b="$1" sel="$3" level="$4" local_dir="$5" rep
     load_target "$2"
     rep="$CFG_BACKUP_DIR/reports/target_${2}_$(date -u +%Y%m%dT%H%M%SZ).txt"
-    rclone_run lsjson -R --files-only --fast-list --no-mimetype --files-from-raw "$sel" "$(target_root)" \
-        >"$RUNDIR/target.json" || { err "cannot list target $2: $(rclone_err)"; return 1; }
+    s3_list DST "$TGT_BUCKET" "$TGT_PREFIX" "$RUNDIR/target.json" \
+        || { err "cannot list target $2: $(rclone_err)"; return 1; }
     cfgpy verify-target "$sel" "$b/manifest.jsonl.gz" "$RUNDIR/target.json" "$rep" || return 1
     if [[ $level == full ]]; then
-        [[ -d $local_dir ]] || { err "full target check needs the backup's files on disk"; return 1; }
-        log "comparing every restored object byte for byte (rclone check --download)"
-        rclone_run check --download --one-way --files-from-raw "$sel" "$local_dir" "$(target_root)" \
+        [[ -d $local_dir || $(eng DST) == aws ]] || { err "full target check needs the backup's files on disk"; return 1; }
+        log "comparing every restored object byte for byte"
+        s3_check_full DST "$TGT_BUCKET" "$TGT_PREFIX" "$local_dir" "$sel" "$b" \
             || { err "target $2 differs from the backup: $(rclone_err)"; return 1; }
         ok "target $2: every restored object matches byte for byte"
     fi
@@ -2401,9 +2868,9 @@ restore_core() {
             ok "dry run: would $mode-restore $S_COUNT object(s) ($(human "$S_BYTES")) into $DEP_URL $dest"
             return 0
         fi
-        if ! rclone_run lsf --max-depth 1 "DST:$TGT_BUCKET" >/dev/null 2>&1; then
+        if ! s3_bucket_exists DST "$TGT_BUCKET"; then
             if [[ $create == true || $TGT_CREATE == true ]]; then
-                rclone_run mkdir "DST:$TGT_BUCKET" || die "cannot create bucket $TGT_BUCKET: $(rclone_err)"
+                s3_mkbucket DST "$TGT_BUCKET" || die "cannot create bucket $TGT_BUCKET: $(rclone_err)"
                 log "created bucket $TGT_BUCKET"
             else
                 die "bucket $TGT_BUCKET does not exist on $DEP_URL (use --create or create: true)"
@@ -2441,8 +2908,7 @@ restore_core() {
 
     if [[ -n $todir ]]; then
         if [[ $fmt == snapshot ]]; then
-            DOCKER_MOUNTS+=("$todir")
-            rclone_run copy --files-from-raw "$R_SEL" "$R_SRCDIR" "$todir" || die "copy failed: $(rclone_err)"
+            cfg_eval stage-sel "$R_SRCDIR" "$R_SEL" "$todir" copy   # real copies: the backup must stay untouched
         fi
         cfgpy verify-tree "$b" "$todir" "$([[ $vlevel == full ]] && echo 1 || echo 0)" "$CFG_HASH_WORKERS" "" "$R_SEL" "" \
             || die "restored files do not match the backup"
@@ -2450,18 +2916,11 @@ restore_core() {
         return 0
     fi
 
-    local -a how=(copy)
-    [[ $mode == skip-existing ]] && how=(copy --ignore-existing)
-    if [[ $mode == mirror ]]; then
-        rclone_run sync "$R_SRCDIR${prefix:+/$prefix}" "$dest${prefix:+/$prefix}" --s3-no-check-bucket \
-            || die "restore failed: $(rclone_err)"
-    else
-        rclone_run "${how[@]}" --files-from-raw "$R_SEL" --s3-no-check-bucket "$R_SRCDIR" "$dest" \
-            || die "restore failed: $(rclone_err)"
-    fi
+    s3_upload DST "$R_SRCDIR" "$R_SEL" "$TGT_BUCKET" "$TGT_PREFIX" "$mode" "$prefix" \
+        || die "restore failed: $(rclone_err)"
     local m
     while IFS= read -r m; do
-        [[ -n $m ]] && { rclone_run mkdir --s3-directory-markers "$dest/${m%/}" || warn "cannot recreate folder marker $m"; }
+        [[ -n $m ]] && { s3_marker DST "$TGT_BUCKET" "$TGT_PREFIX" "$m" || warn "cannot recreate folder marker $m"; }
     done <"$R_SEL.markers"
     ok "restored $S_COUNT object(s) into $DEP_URL $dest"
     [[ $vlevel == none ]] && return 0
@@ -2493,7 +2952,7 @@ cmd_restore() {
     [[ $mode =~ ^(merge|mirror|skip-existing)$ ]] || die "restore: --mode must be merge, mirror or skip-existing"
     [[ -n $at && -z $latest ]] && die "restore: --at needs --latest NAME"
     lock global shared
-    resolve_rclone
+    resolve_engines
     pick_backup "$latest" "$at" "$file"
     if [[ -z $vlevel ]]; then
         vlevel=quick
@@ -2524,7 +2983,7 @@ cmd_drill() {
     else names=(${DRILL_SOURCES[@]+"${DRILL_SOURCES[@]}"}); fi
     (( ${#names[@]} )) || die "drill: name a source (or set drill.sources)"
     lock global shared
-    resolve_rclone
+    resolve_engines
     load_target "$target"
     [[ $TGT_SCRATCH == true ]] || die "drill target '$target' must be marked scratch: true — a drill deletes what it restores"
     local n
@@ -2535,7 +2994,7 @@ cmd_drill() {
         local lab
         for lab in "${labs[@]}"; do
             load_target "$target"
-            if [[ -n $(rclone_run lsf -R --files-only --max-depth 50 "$(target_root)" 2>/dev/null | head -1) ]]; then
+            if ! s3_is_empty DST "$TGT_BUCKET" "$TGT_PREFIX"; then
                 err "drill: scratch target $target ($(target_root)) is not empty — refusing"; rc=1; continue
             fi
             R_BACKUP="$(cfgpy pick "$CFG_BACKUP_DIR/$lab" good)"
@@ -2552,10 +3011,8 @@ cmd_drill() {
             # clean the scratch bucket: only the keys this drill wrote
             cfg_eval select "$R_BACKUP/manifest.jsonl.gz" "" "$RUNDIR/drill.sel"
             load_target "$target"
-            if [[ -s $RUNDIR/drill.sel ]]; then
-                rclone_run delete --files-from-raw "$RUNDIR/drill.sel" "$(target_root)" || warn "drill: cleanup of $target failed: $(rclone_err)"
-            fi
-            rclone_run rmdirs --s3-directory-markers --leave-root "$(target_root)" 2>/dev/null || true
+            s3_delete_sel DST "$TGT_BUCKET" "$TGT_PREFIX" "$RUNDIR/drill.sel" "$RUNDIR/drill.sel.markers" \
+                || warn "drill: cleanup of $target failed: $(rclone_err)"
             {
                 echo "s3sync drill report"
                 echo "label:   $lab"
@@ -2579,17 +3036,16 @@ cmd_drill() {
 cmd_test() {
     local deep=false rc=0 n
     [[ ${1:-} == --deep ]] && deep=true
-    resolve_rclone
-    ok "rclone v$RCLONE_VER ($RCLONE_MODE${RCLONE_BIN:+: $RCLONE_BIN})"
-    # backup_dir
+    resolve_engines
+    [[ -n $RCLONE_MODE ]] && ok "rclone v$RCLONE_VER ($RCLONE_MODE${RCLONE_BIN:+: $RCLONE_BIN})"
+    [[ -n $AWS_MODE ]] && ok "aws-cli v$AWS_VER ($AWS_MODE${AWS_BIN:+: $AWS_BIN})"
     local fstype; fstype="$(stat -f -c %T "$CFG_BACKUP_DIR")"
     case "$fstype" in nfs*|cifs|smb*|fuse*) warn "backup_dir is on $fstype: locks and hardlinks may be unreliable" ;; esac
     local probe="$CFG_BACKUP_DIR/.tmp/probe.$$"
     if echo x >"$probe" && ln "$probe" "$probe.l" 2>/dev/null; then ok "backup_dir $CFG_BACKUP_DIR: writable, hardlinks work ($fstype)"
     else err "backup_dir $CFG_BACKUP_DIR: cannot write or hardlink"; rc=1; fi
     rm -f "$probe" "$probe.l"
-    local avail; avail="$(df -B1 --output=avail "$CFG_BACKUP_DIR" | tail -1)"
-    log "    free: $(human "$avail"), inodes free: $(df --output=iavail "$CFG_BACKUP_DIR" | tail -1 | tr -d ' ')"
+    log "    free: $(human "$(df -B1 --output=avail "$CFG_BACKUP_DIR" | tail -1)"), inodes free: $(df --output=iavail "$CFG_BACKUP_DIR" | tail -1 | tr -d ' ')"
     for n in flock sha256sum tar; do have "$n" || { err "$n is missing"; rc=1; }; done
 
     while read -r n; do
@@ -2609,26 +3065,23 @@ cmd_test() {
             else warn "$n: no age_identity_file — restores and full verifies of encrypted archives will need one"; fi
         fi
         if [[ $SRC_ALL_BUCKETS == true ]]; then
-            local c
-            if c="$(rclone_run lsf --dirs-only "SRC:" | wc -l)"; then ok "$n: $SEP_URL reachable, $c bucket(s) visible"
+            if s3_buckets SRC "$RUNDIR/t-buckets.json"; then ok "$n: $SEP_URL reachable ($(eng SRC)), $(cfgpy count "$RUNDIR/t-buckets.json") bucket(s) visible"
             else err "$n: cannot list buckets on $SEP_URL: $(rclone_err)"; rc=1; fi
             continue
         fi
-        local sp; sp="$(src_path "$SRC_BUCKET")"
-        if ! rclone_run lsf --max-depth 1 "$sp" >/dev/null; then
-            err "$n: cannot list $sp on $SEP_URL: $(rclone_err)"; rc=1; continue
+        if ! s3_peek SRC "$SRC_BUCKET" "$SRC_PREFIX"; then
+            err "$n: cannot list $(src_path "$SRC_BUCKET"): $(rclone_err)"; rc=1; continue
         fi
-        ok "$n: $SEP_URL bucket $SRC_BUCKET${SRC_PREFIX:+/$SRC_PREFIX} readable"
+        ok "$n: $(src_path "$SRC_BUCKET") readable ($(eng SRC))"
         if $deep; then
             filter_flags
-            rclone_run lsjson -R --fast-list --use-server-modtime --no-mimetype ${FILT[@]+"${FILT[@]}"} "$sp" >"$RUNDIR/t.json" \
-                || { err "$n: full listing failed"; rc=1; continue; }
+            s3_list SRC "$SRC_BUCKET" "$SRC_PREFIX" "$RUNDIR/t.json" filtered || { err "$n: full listing failed: $(rclone_err)"; rc=1; continue; }
             cfg_eval estimate "$RUNDIR/t.json" ""
             log "    $E_FILES objects, $(human "$E_BYTES"), $E_MARKERS folder marker(s)"
             (( E_SKIPPED > 0 )) && warn "    $E_SKIPPED object(s) cannot be backed up (unrepresentable names or archive storage class)"
             local first; first="$(cfgpy first-key "$RUNDIR/t.json")"
             if [[ -n $first ]]; then
-                if rclone_run cat --count 1 "$sp/$first" >/dev/null; then ok "    read access OK ($first)"
+                if s3_read_one SRC "$SRC_BUCKET" "$SRC_PREFIX" "$first"; then ok "    read access OK ($first)"
                 else err "    cannot read $first: $(rclone_err)"; rc=1; fi
             fi
         fi
@@ -2637,17 +3090,16 @@ cmd_test() {
     while read -r n; do
         [[ -n $n ]] || continue
         load_target "$n"
-        if rclone_run lsf --max-depth 1 "DST:$TGT_BUCKET" >/dev/null 2>&1; then
-            ok "target $n: $DEP_URL bucket $TGT_BUCKET exists${TGT_SCRATCH/false/}"
+        local exists=false owner=""
+        if s3_bucket_exists DST "$TGT_BUCKET"; then
+            exists=true; ok "target $n: $(target_root) exists ($(eng DST))${TGT_SCRATCH/false/}"
         elif [[ $TGT_CREATE == true ]]; then log "target $n: bucket $TGT_BUCKET missing (created on first restore)"
         else err "target $n: bucket $TGT_BUCKET not reachable on $DEP_URL: $(rclone_err)"; rc=1; continue; fi
-        local owner=""
         owner="$(is_source_bucket "$DEP_ID" "$TGT_BUCKET")" || owner=""
         if $deep && [[ -n $owner ]]; then
             warn "    target $n is bucket '$TGT_BUCKET' that source '$owner' backs up — write probe skipped"
-        elif $deep && rclone_run lsf --max-depth 1 "DST:$TGT_BUCKET" >/dev/null 2>&1; then
-            local key; key="$(target_root)/.s3sync-probe-$$"
-            if echo probe | rclone_run rcat "$key" && rclone_run deletefile "$key"; then ok "    write + delete probe OK"
+        elif $deep && $exists; then
+            if s3_write_probe DST "$TGT_BUCKET" "$TGT_PREFIX"; then ok "    write + delete probe OK"
             else err "    write probe failed: $(rclone_err)"; rc=1; fi
         fi
     done < <(cfgpy names "$CONFIG" targets)
@@ -2655,18 +3107,18 @@ cmd_test() {
     if [[ $OFFSITE_ENABLED == true ]]; then
         use_endpoint "$OFFSITE_ENDPOINT" OFF OEP_
         local off_ok=false
-        if rclone_run lsf --max-depth 1 "OFF:$OFFSITE_BUCKET" >/dev/null 2>&1; then
-            ok "offsite: $OEP_URL bucket $OFFSITE_BUCKET reachable"; off_ok=true
-        elif rclone_run lsf --dirs-only "OFF:" >/dev/null 2>&1; then
+        if s3_bucket_exists OFF "$OFFSITE_BUCKET"; then
+            ok "offsite: $OEP_URL bucket $OFFSITE_BUCKET reachable ($(eng OFF))"; off_ok=true
+        elif s3_buckets OFF "$RUNDIR/t-off.json"; then
             warn "offsite: bucket $OFFSITE_BUCKET does not exist yet — the first copy creates it (needs CreateBucket permission)"
         else err "offsite: $OEP_URL not reachable: $(rclone_err)"; rc=1; fi
         if $deep && $off_ok; then
-            local ver; ver="$(rclone_run backend versioning "OFF:$OFFSITE_BUCKET" 2>/dev/null || true)"
+            local ver; ver="$(s3_versioning OFF "$OFFSITE_BUCKET" || true)"
             if [[ $ver == *Enabled* ]]; then ok "    bucket versioning enabled (point-in-time history for snapshots)"
-            else warn "    bucket versioning is ${ver:-unknown}: off-site snapshots keep only the newest state"; fi
+            else warn "    bucket versioning is ${ver:-off}: off-site snapshots keep only the newest state"; fi
         fi
     fi
-    (( rc == 0 )) && ok "all checks passed" || err "some checks FAILED"
+    if (( rc == 0 )); then ok "all checks passed"; else err "some checks FAILED"; fi
     return $rc
 }
 
@@ -2680,25 +3132,24 @@ cmd_discover() {
             *) die "discover: unknown option $1" ;;
         esac
     done
-    resolve_rclone
     local -a eps=()
     if [[ -n $url ]]; then eps=("--url")
     elif [[ -n $only ]]; then eps=("$only")
     else mapfile -t eps < <(cfgpy names "$CONFIG" endpoints); fi
-    local e
+    local e v
     for e in "${eps[@]}"; do
-        local v
         for v in $(compgen -e); do [[ $v == RCLONE_CONFIG_SRC_* ]] && unset "$v"; done
         if [[ $e == --url ]]; then cfg_eval url-endpoint "$CONFIG" "$url" SRC SEP_
         else cfg_eval endpoint "$CONFIG" "$e" SRC SEP_; fi
-        printf '\n%s%s%s  (%s)\n' "$C_B" "$SEP_URL" "$C_0" "${e/--url/url}"
-        rclone_run lsjson --dirs-only "SRC:" >"$RUNDIR/d.json" || { err "cannot list buckets: $(rclone_err)"; continue; }
+        printf '\n%s%s%s  (%s, %s)\n' "$C_B" "$SEP_URL" "$C_0" "${e/--url/url}" "$(eng SRC)"
+        s3_buckets SRC "$RUNDIR/d.json" || { err "cannot list buckets: $(rclone_err)"; continue; }
         printf '  %-40s %12s  %s\n' BUCKET "$($sizes && echo SIZE)" 'BACKED UP BY'
         local b who size
         while IFS=$'\t' read -r b who; do
             size=""
-            $sizes && size="$(rclone_run size --json --fast-list "SRC:$b" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["bytes"])' 2>/dev/null || echo "")"
-            [[ -n $size ]] && size="$(human "$size")"
+            if $sizes && s3_list SRC "$b" "" "$RUNDIR/d-size.json" 2>/dev/null; then
+                size="$(human "$(cfgpy listing-bytes "$RUNDIR/d-size.json")")"
+            fi
             printf '  %-40s %12s  %s\n' "$b" "$size" "${who:-${C_Y}-- NOT BACKED UP${C_0}}"
         done < <(cfgpy discover "$CONFIG" "$SEP_ID" "$RUNDIR/d.json")
     done

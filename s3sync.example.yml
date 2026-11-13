@@ -28,7 +28,8 @@ defaults:
   min_free_space: 10%               # refuse to start when the disk would drop below this (or 20G)
   timeout: 14400                    # seconds per rclone call
   lock_wait: 3600                   # seconds to wait for another run to finish
-  rclone: auto                      # auto | native | docker
+  engine: rclone                    # rclone | aws — S3 client; can also be set per endpoint
+  rclone: auto                      # auto | native | docker (aws-cli: native v2 if installed, else its container)
   # age_identity_file: /etc/s3sync/age.key   # needed to restore / fully verify encrypted archives
 
 notify:
@@ -58,6 +59,7 @@ endpoints:
     url: "https://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio.example.com:9000?provider=Minio&path_style=true"
 
   aws_main:
+    engine: aws                     # use aws-cli for this endpoint (ListObjectsV2, s3transfer)
     provider: AWS                   # AWS | Minio | Ceph | Cloudflare | Wasabi | DigitalOcean | Other ...
     region: ap-south-1
     access_key_env: AWS_ACCESS_KEY_ID

@@ -67,8 +67,10 @@ jobs:
           curl -fsSLO https://downloads.rclone.org/v$v/$z
           curl -fsSL https://downloads.rclone.org/v$v/SHA256SUMS | grep " $z\$" | sha256sum -c -
           unzip -q $z && sudo install -m 0755 rclone-v$v-linux-amd64/rclone /usr/local/bin/rclone
-      - name: end-to-end against MinIO (native rclone)
+      - name: end-to-end against MinIO (native rclone, ghcr.io/coollabsio/minio)
         run: tests/e2e.sh
+      - name: end-to-end with the aws-cli engine (preinstalled aws-cli v2)
+        run: E2E_ENGINE=aws tests/e2e.sh
       - name: end-to-end with the rclone container
         run: |
           sudo mv /usr/local/bin/rclone /usr/local/bin/rclone.off

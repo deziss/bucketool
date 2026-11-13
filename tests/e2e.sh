@@ -4,6 +4,7 @@
 #
 #   tests/e2e.sh                  # needs docker; rclone native or via docker
 #   KEEP=1 tests/e2e.sh           # leave the MinIO container and work dir for inspection
+#   E2E_ENGINE=aws tests/e2e.sh   # run everything through aws-cli instead of rclone
 #
 # Images (override with env): MINIO_IMAGE, MC_IMAGE. Encryption cases run when
 # `age` and `age-keygen` are on PATH.
@@ -89,6 +90,7 @@ cat >"$W/s3sync.yml" <<EOF
 env_file: $W/s3sync.env
 defaults:
   backup_dir: $W/backup
+  engine: ${E2E_ENGINE:-rclone}
   log_file: $W/s3sync.log
   retention_days: 0
   verify: quick

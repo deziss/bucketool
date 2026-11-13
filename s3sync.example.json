@@ -17,6 +17,7 @@
     "min_free_space": "10%",
     "timeout": 14400,
     "lock_wait": 3600,
+    "engine": "rclone",
     "rclone": "auto"
   },
   "notify": {
@@ -45,6 +46,7 @@
       "url": "https://${MINIO_ACCESS_KEY}:${MINIO_SECRET_KEY}@minio.example.com:9000?provider=Minio&path_style=true"
     },
     "aws_main": {
+      "engine": "aws",
       "provider": "AWS",
       "region": "ap-south-1",
       "access_key_env": "AWS_ACCESS_KEY_ID",

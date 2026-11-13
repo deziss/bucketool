@@ -40,7 +40,8 @@ examples in `/etc/s3sync`, and never touches an existing `s3sync.yml` / `s3sync.
 Re-running it is the whole update; without a checkout use `sudo s3sync self-update`.
 
 Requirements: `bash` 4+, `python3` (stdlib only; PyYAML is used if present), GNU coreutils/tar,
-`flock`, and either `rclone` ≥ 1.66 or `docker` (then the pinned `rclone/rclone` image is used).
+`flock`, and one S3 client: `rclone` ≥ 1.66, `aws` CLI v2, or `docker` (then the pinned
+`rclone/rclone` or `amazon/aws-cli` image is used).
 Optional: `zstd` (tar.zst), `pigz`, `age` (encryption), `curl` (alerts, self-update).
 
 ## Config
@@ -81,7 +82,7 @@ The full set of keys, with comments, is in [s3sync.example.yml](s3sync.example.y
 ([JSON twin](s3sync.example.json)). The config is found in this order: `-c FILE` →
 `$S3SYNC_CONFIG` → `./s3sync.yml|.yaml|.json` → next to the script → `/etc/s3sync/`.
 
-**Endpoints** take a URL (`s3://`, `https://`, `http://`; `?tls=false` for plain HTTP on `s3://`)
+**Endpoints** take `engine: rclone | aws` (see below) and a URL (`s3://`, `https://`, `http://`; `?tls=false` for plain HTTP on `s3://`)
 or fields: `provider`, `endpoint`, `region`, `access_key[_env|_file]`, `secret_key[_env|_file]`,
 `session_token[_env|_file]`, `env_auth` (instance role / AWS profile), `path_style`, and
 `options:` — any [rclone s3 option](https://rclone.org/s3/) passed through (e.g. `storage_class`,
@@ -98,6 +99,28 @@ the command line, never a config file on disk. Check how a URL is read with
 **Targets** are where `restore` and `drill` write: `endpoint`, `bucket`, optional `prefix`,
 `create` (create the bucket), `verify` (default check after a restore), `scratch` (allowed as a
 drill target).
+
+### Engine: rclone or aws-cli
+
+Every S3 call goes through one of two engines, chosen with `engine:` in `defaults` or per endpoint:
+
+| | `engine: rclone` (default) | `engine: aws` |
+|---|---|---|
+| Client | rclone ≥ 1.66 or `rclone/rclone:1.75.2` | aws-cli v2 or `amazon/aws-cli:2.40.2` |
+| Listing | `lsjson --fast-list` | `s3api list-objects-v2` (ListObjectsV2) |
+| Download | exact key list (`copy --files-from-raw`) | `s3 sync` limited by the same filters |
+| Filters (`include`/`exclude`) | [rclone patterns](https://rclone.org/filtering/) (`*` stops at `/`, `**` crosses it) | shell globs on the key (`*` crosses `/`) |
+| `bwlimit` | rates and timetables | plain rates only (`50M`) |
+
+Both feed the same manifest, gate, verify and retention logic, and the end-to-end suite runs
+in full against each. Use `engine: aws` when rclone misbehaves against a particular server —
+users report rclone runs against some MinIO deployments that finish without error yet miss
+objects or see listings change between runs. s3sync's gate catches a short download either way;
+switching the engine is the fix when the listing itself is the problem. aws-cli also gives you
+instance-role and SSO credentials exactly as the AWS tooling resolves them (`env_auth: true`).
+The aws engine sends `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` so aws-cli ≥ 2.23 works
+with servers that reject its default CRC checksums. Switching the engine of an existing source
+re-downloads it once (the two clients report LastModified with different precision).
 
 ## Everyday use
 
