@@ -26,7 +26,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly BUCKETOOL_VERSION="1.0.1"
+readonly BUCKETOOL_VERSION="1.0.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME SCRIPT_DIR
@@ -452,8 +452,13 @@ def _secret(e, keys, envkey, filekey, quiet=False):
             v = str(e[a]); break
     if e.get(envkey):
         name = str(e[envkey])
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name) or (name not in os.environ and name.lower() == name):
+            # most likely the secret itself was pasted here: never echo it
+            die('endpoint %s: %s must be the NAME of a variable in env_file (e.g. MINIO_SECRET_KEY), '
+                'not the key itself — put the value in the env file, or use %s: instead'
+                % (e['name'], envkey, envkey[:-4]))
         if name not in os.environ:
-            warn('endpoint %s: environment variable %s is not set' % (e['name'], name))
+            warn('endpoint %s: environment variable %s is not set (is env_file loaded?)' % (e['name'], name))
         v = os.environ.get(name, v)
     if e.get(filekey):
         p = os.path.expanduser(str(e[filekey]))

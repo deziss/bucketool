@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 — 2026-11-13
+
+- `access_key_env` / `secret_key_env` holding a key value instead of a variable name is now an
+  error that never prints the value (it used to be echoed in a "not set" warning).
+
 ## 1.0.1 — 2026-11-13
 
 - Fix: Ctrl-C now stops a run. `timeout` had moved rclone/aws-cli out of the terminal's
