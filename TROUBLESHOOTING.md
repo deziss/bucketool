@@ -13,7 +13,6 @@ that reports the failure.
 | MinIO / Ceph: `PermanentRedirect` or bucket not found | Add `path_style=true` to the URL (or `path_style: true`). |
 | AWS: `AuthorizationHeaderMalformed ... region` | Set `region:` to the bucket's region. |
 | Run hangs, then fails after `timeout` | The server is down or a firewall drops packets. rclone retries 5 times (with 20 low-level retries) before giving up. |
-
 | rclone finishes but objects are missing / listings differ between runs (seen with some MinIO setups) | The gate fails or warns instead of committing a short backup. Set `engine: aws` on that endpoint: it lists with ListObjectsV2 through aws-cli. |
 | aws engine: `XAmzContentSHA256Mismatch` / checksum errors | s3sync already sets `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`; check for a proxy rewriting bodies. |
 | aws engine: `Unknown options` | aws-cli v1 found on PATH. s3sync needs v2; remove v1 or let it use the container. |
