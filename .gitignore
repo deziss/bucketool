@@ -1,14 +1,14 @@
 # ---------------------------------------------------------------------------
 #  Secrets — never commit a real config, env file or key
 # ---------------------------------------------------------------------------
-s3sync.yml
-s3sync.yaml
-s3sync.json
-s3sync.*.yml
-s3sync.*.yaml
-s3sync.*.json
-!s3sync.example.yml
-!s3sync.example.json
+bucketool.yml
+bucketool.yaml
+bucketool.json
+bucketool.*.yml
+bucketool.*.yaml
+bucketool.*.json
+!bucketool.example.yml
+!bucketool.example.json
 .env
 .env.*
 *.env

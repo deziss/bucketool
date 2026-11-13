@@ -1,0 +1,27 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Never paste access keys, secret keys or a full config with credentials. Security issues: see SECURITY.md."
+  - type: input
+    id: version
+    attributes: { label: bucketool version, description: "`bucketool --version`" }
+    validations: { required: true }
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options: [rclone (native), rclone (docker), aws-cli (native), aws-cli (docker)]
+    validations: { required: true }
+  - type: input
+    id: server
+    attributes: { label: S3 server, description: "e.g. MinIO RELEASE.2025-10-15, AWS S3, Ceph Reef, R2" }
+  - type: textarea
+    id: what
+    attributes: { label: What happened, description: Command, output (run with -v), and what you expected }
+    validations: { required: true }
+  - type: textarea
+    id: config
+    attributes: { label: Relevant config (redacted), render: yaml }

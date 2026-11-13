@@ -1,6 +1,10 @@
-# s3sync — S3 / MinIO bucket backup, restore & verify
+# bucketool — S3 / MinIO bucket backup, restore & verify
 
+[![ci](https://github.com/deziss/bucketool/actions/workflows/ci.yml/badge.svg)](https://github.com/deziss/bucketool/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/deziss/bucketool?sort=semver)](https://github.com/deziss/bucketool/releases)
 [![license: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+![bash](https://img.shields.io/badge/bash-4.4%2B-4EAA25?logo=gnubash&logoColor=white)
+![S3 compatible](https://img.shields.io/badge/S3-AWS%20%7C%20MinIO%20%7C%20Ceph%20%7C%20R2-569A31?logo=amazons3&logoColor=white)
 
 One shell script, one config file (YAML **or** JSON). Backs up any S3-compatible bucket —
 AWS S3, MinIO, Ceph RGW, Cloudflare R2, Wasabi, Garage, DigitalOcean Spaces — to local disk, proves
@@ -19,25 +23,25 @@ the backup is complete, restores it anywhere, and runs unattended from systemd.
 
 Operating procedure: [SOP.md](SOP.md). Something failing: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-> **Your real config never belongs in git.** Copy an example to `/etc/s3sync/s3sync.yml`, put keys
-> in `/etc/s3sync/s3sync.env` (mode 0600). `.gitignore` blocks real configs, env files, keys and
+> **Your real config never belongs in git.** Copy an example to `/etc/bucketool/bucketool.yml`, put keys
+> in `/etc/bucketool/bucketool.env` (mode 0600). `.gitignore` blocks real configs, env files, keys and
 > backup artifacts.
 
 ## Install
 
 ```bash
-git clone https://github.com/deziss/s3sync.git && cd s3sync
+git clone https://github.com/deziss/bucketool.git && cd bucketool
 sudo ./install.sh --with-rclone --systemd   # rclone is optional: docker is used if it is missing
 
-# edit /etc/s3sync/s3sync.yml and /etc/s3sync/s3sync.env, then:
-s3sync test --deep
+# edit /etc/bucketool/bucketool.yml and /etc/bucketool/bucketool.env, then:
+bucketool test --deep
 ```
 
-`install.sh` puts the script in `/opt/s3sync`, links `/usr/local/bin/s3sync`, refreshes the
-examples in `/etc/s3sync`, and never touches an existing `s3sync.yml` / `s3sync.env`.
+`install.sh` puts the script in `/opt/bucketool`, links `/usr/local/bin/bucketool`, refreshes the
+examples in `/etc/bucketool`, and never touches an existing `bucketool.yml` / `bucketool.env`.
 `--with-rclone` downloads a pinned rclone and checks it against the official `SHA256SUMS`.
 `--systemd` enables the nightly backup timer and the weekly verify/drill timer.
-Re-running it is the whole update; without a checkout use `sudo s3sync self-update`.
+Re-running it is the whole update; without a checkout use `sudo bucketool self-update`.
 
 Requirements: `bash` 4.4+, `python3` (stdlib only; PyYAML is used if present), GNU coreutils/tar,
 `flock`, and one S3 client: `rclone` ≥ 1.66, `aws` CLI v2, or `docker` (then the pinned
@@ -47,7 +51,7 @@ Optional: `zstd` (tar.zst), `pigz`, `age` (encryption), `curl` (alerts, self-upd
 ## Config
 
 ```yaml
-env_file: /etc/s3sync/s3sync.env
+env_file: /etc/bucketool/bucketool.env
 
 defaults:
   backup_dir: /backup/s3
@@ -78,9 +82,9 @@ targets:
   minio_dr: { endpoint: minio_prod, bucket: media-restore, create: true }
 ```
 
-The full set of keys, with comments, is in [s3sync.example.yml](s3sync.example.yml)
-([JSON twin](s3sync.example.json)). The config is found in this order: `-c FILE` →
-`$S3SYNC_CONFIG` → `./s3sync.yml|.yaml|.json` → next to the script → `/etc/s3sync/`.
+The full set of keys, with comments, is in [bucketool.example.yml](bucketool.example.yml)
+([JSON twin](bucketool.example.json)). The config is found in this order: `-c FILE` →
+`$BUCKETOOL_CONFIG` → `./bucketool.yml|.yaml|.json` → next to the script → `/etc/bucketool/`.
 
 **Endpoints** take `engine: rclone | aws` (see below) and a URL (`s3://`, `https://`, `http://`; `?tls=false` for plain HTTP on `s3://`)
 or fields: `provider`, `endpoint`, `region`, `access_key[_env|_file]`, `secret_key[_env|_file]`,
@@ -88,7 +92,7 @@ or fields: `provider`, `endpoint`, `region`, `access_key[_env|_file]`, `secret_k
 `options:` — any [rclone s3 option](https://rclone.org/s3/) passed through (e.g. `storage_class`,
 `server_side_encryption`). Credentials reach rclone through environment variables only — never
 the command line, never a config file on disk. Check how a URL is read with
-`s3sync parse-url URL`.
+`bucketool parse-url URL`.
 
 **Sources** need `endpoint` and `bucket` (or `all_buckets: true` with optional `include_buckets` /
 `exclude_buckets` globs; each bucket becomes the label `<name>_<bucket>`). Optional: `prefix`,
@@ -115,7 +119,7 @@ Every S3 call goes through one of two engines, chosen with `engine:` in `default
 Both feed the same manifest, gate, verify and retention logic, and the end-to-end suite runs
 in full against each. Use `engine: aws` when rclone misbehaves against a particular server —
 users report rclone runs against some MinIO deployments that finish without error yet miss
-objects or see listings change between runs. s3sync's gate catches a short download either way;
+objects or see listings change between runs. bucketool's gate catches a short download either way;
 switching the engine is the fix when the listing itself is the problem. aws-cli also gives you
 instance-role and SSO credentials exactly as the AWS tooling resolves them (`env_auth: true`).
 The aws engine sends `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` so aws-cli ≥ 2.23 works
@@ -125,15 +129,15 @@ re-downloads it once (the two clients report LastModified with different precisi
 ## Everyday use
 
 ```bash
-s3sync test --deep                         # rclone, disk, every source/target/off-site, unbackupable keys
-s3sync discover                            # buckets on each server, and which nobody backs up
-s3sync backup all                          # what the nightly timer runs
-s3sync backup media,invoices -n            # dry run: what would be downloaded
-s3sync list                                # backups, sizes, what hardlinks save
-s3sync verify --latest all --full          # re-hash every object of every newest backup
-s3sync restore --latest media -t minio_dr  # newest good backup into a bucket, then verify it
-s3sync drill media -t scratch -y           # restore drill with RPO/RTO report
-s3sync prune                               # apply retention now
+bucketool test --deep                         # rclone, disk, every source/target/off-site, unbackupable keys
+bucketool discover                            # buckets on each server, and which nobody backs up
+bucketool backup all                          # what the nightly timer runs
+bucketool backup media,invoices -n            # dry run: what would be downloaded
+bucketool list                                # backups, sizes, what hardlinks save
+bucketool verify --latest all --full          # re-hash every object of every newest backup
+bucketool restore --latest media -t minio_dr  # newest good backup into a bucket, then verify it
+bucketool drill media -t scratch -y           # restore drill with RPO/RTO report
+bucketool prune                               # apply retention now
 ```
 
 Exit status: `0` ok, `1` failure, `2` usage, `3` finished with warnings (an object could not be
@@ -147,7 +151,7 @@ list bucket once ─► diff with last manifest ─► link/unlink ─► downlo
 
 1. **One listing, no per-object requests.** `rclone lsjson --fast-list --use-server-modtime`
    returns key, size and LastModified for the whole bucket. Nothing is read per object.
-2. **s3sync decides what changed**, by comparing (size, LastModified) with the previous good
+2. **bucketool decides what changed**, by comparing (size, LastModified) with the previous good
    backup's manifest — not by trusting ETags, which are not checksums for multipart uploads.
 3. **Snapshots** start as `cp -al` of the previous snapshot. Every changed or deleted object is
    *unlinked* from the new tree before anything is downloaded, so rclone only ever writes new
@@ -201,15 +205,15 @@ backup must be one encrypted file.
 
 **Encryption**: `encrypt: age` with `age_recipients` (public keys) on a `tar.zst` / `tar.gz`
 source. The host that makes backups never needs the private key; restore and full verify need
-`defaults.age_identity_file` (mode 0600). `s3sync test` checks the key pair matches.
+`defaults.age_identity_file` (mode 0600). `bucketool test` checks the key pair matches.
 
 ## Verify
 
 ```bash
-s3sync verify --latest media              # quick: every object present with the right size, SHA256SUMS, archive integrity
-s3sync verify --latest media --full       # re-hash every object against the manifest
-s3sync verify --latest media -t minio_dr  # also check a restored bucket against the backup
-s3sync verify /backup/s3/media/20261113T013000Z
+bucketool verify --latest media              # quick: every object present with the right size, SHA256SUMS, archive integrity
+bucketool verify --latest media --full       # re-hash every object against the manifest
+bucketool verify --latest media -t minio_dr  # also check a restored bucket against the backup
+bucketool verify /backup/s3/media/20261113T013000Z
 ```
 
 Every backup is verified right after it is written (`defaults.verify`, `quick` by default). When
@@ -219,11 +223,11 @@ the damaged inode, and the object is downloaded fresh on the next run.
 ## Restore
 
 ```bash
-s3sync restore --latest media -t minio_dr                           # merge into the target bucket
-s3sync restore --latest media --at 2026-11-01 -t minio_dr           # newest good backup on or before a date (UTC)
-s3sync restore --latest media --prefix invoices/2026 --to-dir /srv/restore
-s3sync restore --latest media --include '*.pdf' -t minio_dr --verify full
-s3sync restore -f /backup/s3/media/20261113T013000Z -t minio_dr --mode mirror -y
+bucketool restore --latest media -t minio_dr                           # merge into the target bucket
+bucketool restore --latest media --at 2026-11-01 -t minio_dr           # newest good backup on or before a date (UTC)
+bucketool restore --latest media --prefix invoices/2026 --to-dir /srv/restore
+bucketool restore --latest media --include '*.pdf' -t minio_dr --verify full
+bucketool restore -f /backup/s3/media/20261113T013000Z -t minio_dr --mode mirror -y
 ```
 
 - `--mode merge` (default) uploads the backup over the target; `skip-existing` leaves existing
@@ -243,24 +247,24 @@ s3sync restore -f /backup/s3/media/20261113T013000Z -t minio_dr --mode mirror -y
 
 | Timer | Runs | When |
 |---|---|---|
-| `s3sync-backup.timer` | `backup all` → verify → off-site → prune → metrics → alerts | nightly 01:30 |
-| `s3sync-verify.timer` | `verify --latest all --full`, then `drill` | Sundays 05:00 |
+| `bucketool-backup.timer` | `backup all` → verify → off-site → prune → metrics → alerts | nightly 01:30 |
+| `bucketool-verify.timer` | `verify --latest all --full`, then `drill` | Sundays 05:00 |
 
 `SuccessExitStatus=3` keeps warnings from marking the unit failed. `ReadWritePaths` in the units
 must match `backup_dir`. cron works too:
 
 ```cron
-30 1 * * * S3SYNC_CONFIG=/etc/s3sync/s3sync.yml /opt/s3sync/s3sync.sh backup all -y -q >> /var/log/s3sync-cron.log 2>&1
+30 1 * * * BUCKETOOL_CONFIG=/etc/bucketool/bucketool.yml /opt/bucketool/bucketool.sh backup all -y -q >> /var/log/bucketool-cron.log 2>&1
 ```
 
 - **Alerts**: `notify.healthcheck_url` gets `/start`, success and `/fail` pings
   ([healthchecks.io](https://healthchecks.io) or compatible); `notify.webhook` gets a JSON POST on
   failure or warning (and on success with `on_success: true`). A failed alert never fails a backup.
-- **Metrics**: with `metrics.textfile_dir`, a `s3sync.prom` file for node_exporter's textfile
-  collector: `s3sync_last_success_timestamp_seconds`, `s3sync_last_backup_ok`, `s3sync_backup_bytes`,
-  `s3sync_backup_unique_bytes`, `s3sync_backup_objects`, `s3sync_backup_skipped_objects`,
-  `s3sync_backup_duration_seconds`, `s3sync_backups` — all per label. Alert on
-  `time() - s3sync_last_success_timestamp_seconds > 93600`.
+- **Metrics**: with `metrics.textfile_dir`, a `bucketool.prom` file for node_exporter's textfile
+  collector: `bucketool_last_success_timestamp_seconds`, `bucketool_last_backup_ok`, `bucketool_backup_bytes`,
+  `bucketool_backup_unique_bytes`, `bucketool_backup_objects`, `bucketool_backup_skipped_objects`,
+  `bucketool_backup_duration_seconds`, `bucketool_backups` — all per label. Alert on
+  `time() - bucketool_last_success_timestamp_seconds > 93600`.
 - **Locks**: two runs never touch the same label at once; prune waits for running backups and
   verifies. A run waits up to `lock_wait` seconds, then fails rather than run unlocked.
 - **Resume**: an interrupted snapshot run is picked up by the next run; what was already
@@ -303,8 +307,11 @@ offsite: { enabled: true, endpoint: offsite_s3, bucket: s3-backups, prefix: host
 
 ## Contributing
 
+Bug reports and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Security issues: [SECURITY.md](SECURITY.md), please not as public issues.
+
 ```bash
-bash -n s3sync.sh && shellcheck --severity=warning s3sync.sh install.sh tests/e2e.sh
+bash -n bucketool.sh && shellcheck --severity=warning bucketool.sh install.sh tests/e2e.sh
 python3 tests/test_py.py       # unit tests for the embedded helper
 tests/e2e.sh                   # full round trip against a throwaway MinIO (needs docker)
 ```
@@ -312,4 +319,4 @@ tests/e2e.sh                   # full round trip against a throwaway MinIO (need
 ## License
 
 GNU Affero General Public License v3.0 or later — see [LICENSE](LICENSE).
-Copyright (C) 2026 Anshu Kushwaha. s3sync comes with **no warranty**.
+Copyright (C) 2026 Anshu Kushwaha. bucketool comes with **no warranty**.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the python helper embedded in s3sync.sh.
+"""Unit tests for the python helper embedded in bucketool.sh.
 
     python3 tests/test_py.py
 """
@@ -17,7 +17,7 @@ from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SCRIPT = os.path.join(ROOT, 's3sync.sh')
+SCRIPT = os.path.join(ROOT, 'bucketool.sh')
 
 
 def load_helper():
@@ -27,7 +27,7 @@ def load_helper():
     tmp = tempfile.NamedTemporaryFile('w', suffix='.py', delete=False)
     tmp.write(m.group(1))
     tmp.close()
-    spec = importlib.util.spec_from_file_location('s3sync_helper', tmp.name)
+    spec = importlib.util.spec_from_file_location('bucketool_helper', tmp.name)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     os.unlink(tmp.name)
@@ -221,15 +221,15 @@ class ConfigTests(unittest.TestCase):
         os.unlink(self.helper)
 
     def test_yaml_and_json_examples_agree(self):
-        y = os.path.join(ROOT, 's3sync.example.yml')
-        j = os.path.join(ROOT, 's3sync.example.json')
+        y = os.path.join(ROOT, 'bucketool.example.yml')
+        j = os.path.join(ROOT, 'bucketool.example.json')
         for mode in (('defaults', 'CFG_'), ('names', 'sources'), ('names', 'targets'),
                      ('source', 'media', 'S_'), ('source', 'invoices', 'S_'), ('source', 'minio_all', 'S_'),
                      ('target', 'scratch', 'T_'), ('section', 'offsite', 'O_'), ('section', 'drill', 'D_')):
             self.assertEqual(self.emit(y, *mode), self.emit(j, *mode), mode)
 
     def test_endpoint_emits_env_not_argv(self):
-        out = self.emit(os.path.join(ROOT, 's3sync.example.yml'), 'endpoint', 'minio_prod', 'SRC', 'E_')
+        out = self.emit(os.path.join(ROOT, 'bucketool.example.yml'), 'endpoint', 'minio_prod', 'SRC', 'E_')
         self.assertIn("export RCLONE_CONFIG_SRC_SECRET_ACCESS_KEY='sk'", out)
         self.assertIn("E_ID='minio.example.com:9000'", out)
 

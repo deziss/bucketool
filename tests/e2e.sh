@@ -12,14 +12,14 @@
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-S3SYNC="$HERE/../s3sync.sh"
+BUCKETOOL="$HERE/../bucketool.sh"
 MINIO_IMAGE="${MINIO_IMAGE:-ghcr.io/coollabsio/minio:latest}"
 MC_IMAGE="${MC_IMAGE:-pgsty/mc:latest}"
 PORT="${PORT:-$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')}"
 AK=e2eadmin
 SK=e2esecret-$RANDOM$RANDOM
-NAME="s3sync-e2e-$$"
-W="$(mktemp -d "${TMPDIR:-/tmp}/s3sync-e2e.XXXXXX")"
+NAME="bucketool-e2e-$$"
+W="$(mktemp -d "${TMPDIR:-/tmp}/bucketool-e2e.XXXXXX")"
 mkdir -p "$W/seed" "$W/metrics"   # must exist before docker bind-mounts it, or dockerd creates it as root
 PASS=0
 FAIL=0
@@ -45,7 +45,7 @@ expect() {  # expect <status> <description> -- command...
     if [[ $got == "$want" ]]; then ok "$what (exit $got)"
     else bad "$what: exit $got, wanted $want"; tail -20 "$W/last.out" | sed 's/^/    /'; fi
 }
-s3()  { "$S3SYNC" -c "$W/s3sync.yml" "$@"; }
+s3()  { "$BUCKETOOL" -c "$W/bucketool.yml" "$@"; }
 mc()  { docker run --rm -i --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
            -e "MC_HOST_e2e=http://$AK:$SK@127.0.0.1:$PORT" \
            -v "$W/seed:$W/seed" "$MC_IMAGE" "$@"; }
@@ -82,16 +82,16 @@ if command -v age >/dev/null && command -v age-keygen >/dev/null; then
     AGE_PUB="$(age-keygen -y "$W/age.key")"; AGE_OK=true
 fi
 
-cat >"$W/s3sync.env" <<EOF
+cat >"$W/bucketool.env" <<EOF
 E2E_AK=$AK
 E2E_SK=$SK
 EOF
-cat >"$W/s3sync.yml" <<EOF
-env_file: $W/s3sync.env
+cat >"$W/bucketool.yml" <<EOF
+env_file: $W/bucketool.env
 defaults:
   backup_dir: $W/backup
   engine: ${E2E_ENGINE:-rclone}
-  log_file: $W/s3sync.log
+  log_file: $W/bucketool.log
   retention_days: 0
   verify: quick
   hash_workers: 2
@@ -133,7 +133,7 @@ sources:
     all_buckets: true
     include_buckets: ["other"]
 EOF
-if $AGE_OK; then cat >>"$W/s3sync.yml" <<EOF
+if $AGE_OK; then cat >>"$W/bucketool.yml" <<EOF
   - name: media_age
     endpoint: local
     bucket: media
@@ -142,7 +142,7 @@ if $AGE_OK; then cat >>"$W/s3sync.yml" <<EOF
     age_recipients: ["$AGE_PUB"]
 EOF
 fi
-cat >>"$W/s3sync.yml" <<EOF
+cat >>"$W/bucketool.yml" <<EOF
 targets:
   restore_a: { endpoint: local, bucket: restore-a }
   restore_b: { endpoint: local, bucket: restore-b, create: true }
@@ -150,7 +150,7 @@ targets:
   notscratch: { endpoint: local, bucket: restore-a }
   intosource: { endpoint: local, bucket: media }
 EOF
-chmod 600 "$W/s3sync.env"
+chmod 600 "$W/bucketool.env"
 
 # ---------------------------------------------------------------------------
 step "preflight"
@@ -200,7 +200,7 @@ grep -q 'new/new.txt' "$W/off.txt" && ! grep -q 'dir/nested/file.bin' "$W/off.tx
     && ok "off-site current/ follows the delta (added + deleted)" || bad "off-site current: $(cat "$W/off.txt")"
 mc ls e2e/offsite/host01/media/manifests/ | grep -q "$(basename "$B2")" && ok "manifest copied off-site" || bad "off-site manifest"
 grep -q '"offsite": "20' "$B2/meta.json" && ok "meta records off-site copy" || bad "meta offsite field"
-grep -q 's3sync_backup_bytes{label="media"}' "$W/metrics/s3sync.prom" && ok "metrics textfile written" || bad "metrics file"
+grep -q 'bucketool_backup_bytes{label="media"}' "$W/metrics/bucketool.prom" && ok "metrics textfile written" || bad "metrics file"
 
 step "verify"
 expect 0 "verify --latest media" -- s3 verify --latest media
@@ -283,21 +283,21 @@ for d in 20260101T020000Z 20260102T020000Z 20260108T020000Z 20260115T020000Z 202
     mkdir -p "$L/$d"; echo '{"verify":"quick-ok","format":"snapshot"}' >"$L/$d/meta.json"
 done
 mkdir -p "$L/20260302T020000Z"; echo '{"verify":"failed","format":"snapshot"}' >"$L/20260302T020000Z/meta.json"
-cat >>"$W/s3sync.yml" <<EOF
+cat >>"$W/bucketool.yml" <<EOF
   # (appended by e2e for the retention test)
 EOF
-python3 - "$W/s3sync.yml" <<'PY'
+python3 - "$W/bucketool.yml" <<'PY'
 import sys
 p=sys.argv[1]; s=open(p).read()
 s=s.replace("sources:\n","sources:\n  - name: ret\n    endpoint: local\n    bucket: media\n    enabled: false\n    retention_min_keep: 1\n    keep_monthly: 2\n",1)
 open(p,'w').write(s)
 PY
-expect 0 "prune (GFS keep_monthly: 2)" -- env S3SYNC_NOW="$(date -d 2026-03-10 +%s)" "$S3SYNC" -c "$W/s3sync.yml" prune
+expect 0 "prune (GFS keep_monthly: 2)" -- env BUCKETOOL_NOW="$(date -d 2026-03-10 +%s)" "$BUCKETOOL" -c "$W/bucketool.yml" prune
 left="$(ls "$L" | tr '\n' ' ')"
 # the failed 0302 run is newer than every good backup: kept for inspection until a good one follows
 [[ $left == "20260201T020000Z 20260301T020000Z 20260302T020000Z " ]] && ok "GFS kept newest of last 2 months, dropped older" || bad "retention left: $left"
 mkdir -p "$L/20260303T020000Z"; echo '{"verify":"quick-ok","format":"snapshot"}' >"$L/20260303T020000Z/meta.json"
-expect 0 "prune again after a newer good backup" -- env S3SYNC_NOW="$(date -d 2026-03-10 +%s)" "$S3SYNC" -c "$W/s3sync.yml" prune
+expect 0 "prune again after a newer good backup" -- env BUCKETOOL_NOW="$(date -d 2026-03-10 +%s)" "$BUCKETOOL" -c "$W/bucketool.yml" prune
 [[ ! -e $L/20260302T020000Z ]] && ok "failed backup dropped once a newer good one exists" || bad "failed backup kept"
 
 step "list + metrics"

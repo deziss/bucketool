@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0
+## 1.0.0 — 2026-11-13
 
 First release.
 
@@ -8,7 +8,7 @@ First release.
   native (>= 1.66) or the pinned `rclone/rclone:1.75.2` container.
 - Formats: hardlinked incremental snapshots, `tar.zst`, `tar.gz`, `zip`; optional `age` encryption
   for tar formats.
-- One listing per run, no per-object HEAD requests; s3sync decides what changed from the previous
+- One listing per run, no per-object HEAD requests; bucketool decides what changed from the previous
   manifest and unlinks changed paths before downloading, so older snapshots are never modified.
 - Completeness gate, resumable interrupted runs, objects changing mid-run reported instead of failing.
 - Manifest with SHA-256 per object; `verify` quick/full, against a restored bucket, with bit-rot

@@ -1,15 +1,15 @@
 [Unit]
-Description=S3 bucket backup (s3sync)
-Documentation=file:/opt/s3sync/README.md
+Description=S3 bucket backup (bucketool)
+Documentation=file:/opt/bucketool/README.md
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=root
-# Credentials stay out of the unit: s3sync reads them from the config / env_file.
-Environment=S3SYNC_CONFIG=/etc/s3sync/s3sync.yml
-ExecStart=/opt/s3sync/s3sync.sh backup all --yes --quiet
+# Credentials stay out of the unit: bucketool reads them from the config / env_file.
+Environment=BUCKETOOL_CONFIG=/etc/bucketool/bucketool.yml
+ExecStart=/opt/bucketool/bucketool.sh backup all --yes --quiet
 # 3 = finished with warnings (skipped objects, an object changed mid-run): still a success
 SuccessExitStatus=3
 TimeoutStartSec=12h

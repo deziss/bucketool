@@ -1,16 +1,16 @@
 [Unit]
-Description=Weekly full verification and restore drill (s3sync)
-Documentation=file:/opt/s3sync/SOP.md
+Description=Weekly full verification and restore drill (bucketool)
+Documentation=file:/opt/bucketool/SOP.md
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=root
-Environment=S3SYNC_CONFIG=/etc/s3sync/s3sync.yml
+Environment=BUCKETOOL_CONFIG=/etc/bucketool/bucketool.yml
 # Re-hash every object of every newest backup, then restore into the scratch target.
-ExecStart=/opt/s3sync/s3sync.sh verify --latest all --full --yes --quiet
-ExecStart=/opt/s3sync/s3sync.sh drill --yes --quiet
+ExecStart=/opt/bucketool/bucketool.sh verify --latest all --full --yes --quiet
+ExecStart=/opt/bucketool/bucketool.sh drill --yes --quiet
 TimeoutStartSec=12h
 Nice=15
 IOSchedulingClass=idle

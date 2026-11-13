@@ -1,4 +1,4 @@
-# s3sync — Troubleshooting
+# bucketool — Troubleshooting
 
 Run with `-v` to see rclone's own output. Every rclone error is also summarised in the log line
 that reports the failure.
@@ -7,15 +7,15 @@ that reports the failure.
 
 | Symptom | Cause / fix |
 |---|---|
-| `listing ... failed: ... InvalidAccessKeyId / SignatureDoesNotMatch` | Wrong keys, or the env file was not loaded (`env_file:` path, `${VAR}` names). `s3sync parse-url URL` shows how a URL is read. |
+| `listing ... failed: ... InvalidAccessKeyId / SignatureDoesNotMatch` | Wrong keys, or the env file was not loaded (`env_file:` path, `${VAR}` names). `bucketool parse-url URL` shows how a URL is read. |
 | `... no such host` / `connection refused` | `endpoint` / URL host and port. For plain HTTP use `http://` or `?tls=false`. |
 | `InvalidBucketName` | Bucket names are 3-63 characters. |
 | MinIO / Ceph: `PermanentRedirect` or bucket not found | Add `path_style=true` to the URL (or `path_style: true`). |
 | AWS: `AuthorizationHeaderMalformed ... region` | Set `region:` to the bucket's region. |
 | Run hangs, then fails after `timeout` | The server is down or a firewall drops packets. rclone retries 5 times (with 20 low-level retries) before giving up. |
 | rclone finishes but objects are missing / listings differ between runs (seen with some MinIO setups) | The gate fails or warns instead of committing a short backup. Set `engine: aws` on that endpoint: it lists with ListObjectsV2 through aws-cli. |
-| aws engine: `XAmzContentSHA256Mismatch` / checksum errors | s3sync already sets `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`; check for a proxy rewriting bodies. |
-| aws engine: `Unknown options` | aws-cli v1 found on PATH. s3sync needs v2; remove v1 or let it use the container. |
+| aws engine: `XAmzContentSHA256Mismatch` / checksum errors | bucketool already sets `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`; check for a proxy rewriting bodies. |
+| aws engine: `Unknown options` | aws-cli v1 found on PATH. bucketool needs v2; remove v1 or let it use the container. |
 
 ## Disk
 
@@ -32,7 +32,7 @@ Listed with a reason in `skipped.jsonl` of the backup and by `test --deep`:
 
 - **Name is also a folder** (`a` and `a/b` both exist) — a file cannot also be a directory.
   Rename one at the source. Note: MinIO in single-drive mode may hide `a/b` from listings
-  entirely when `a` exists; s3sync cannot see it either.
+  entirely when `a` exists; bucketool cannot see it either.
 - **`//`, leading `/`, `.` / `..` segments, a segment longer than 255 bytes, a line break** — not
   representable as a path on Linux.
 - **Data stored under a key ending in `/`** — a folder-style key with content.
@@ -51,8 +51,8 @@ Listed with a reason in `skipped.jsonl` of the backup and by `test --deep`:
 
 ## Locks
 
-`lock 'label-media' is still held by another s3sync run` — a backup of that label is running (or
-hung). `ps aux | grep s3sync`. Locks live in `backup_dir/.locks/` and are released by the kernel
+`lock 'label-media' is still held by another bucketool run` — a backup of that label is running (or
+hung). `ps aux | grep bucketool`. Locks live in `backup_dir/.locks/` and are released by the kernel
 when the process exits; never delete the files to "unlock" a running job.
 
 ## Restore

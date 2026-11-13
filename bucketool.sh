@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# s3sync.sh — S3 / MinIO bucket backup, restore and verify
+# bucketool.sh — S3 / MinIO bucket backup, restore and verify
 #
 # Description: Config-driven (YAML or JSON) backup tool for any S3-compatible
 #              object store (AWS S3, MinIO, Ceph, R2, Wasabi, Garage, ...).
 #              Backups land on local disk as hardlinked incremental snapshots
 #              or as tar.zst / tar.gz / zip archives, each with a manifest that
 #              drives verification, restore checks, retention and off-site copy.
-# Usage:       ./s3sync.sh <command> [options]     (run with -h for full help)
+# Usage:       ./bucketool.sh <command> [options]     (run with -h for full help)
 # Prereqs:     bash 4+, python3, GNU coreutils/tar, flock, and either rclone
 #              >= 1.66 or docker. Optional: zstd, pigz, age, curl.
 #
@@ -26,28 +26,28 @@
 set -Eeuo pipefail
 umask 077
 
-readonly S3SYNC_VERSION="1.0.0"
+readonly BUCKETOOL_VERSION="1.0.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME SCRIPT_DIR
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s/%s' "$SCRIPT_DIR" "$SCRIPT_NAME")"
-S3SYNC_REPO="${S3SYNC_REPO:-deziss/s3sync}"
-S3SYNC_UPDATE_CHANNEL="${S3SYNC_UPDATE_CHANNEL:-release}"
-S3SYNC_UPDATE_URL="${S3SYNC_UPDATE_URL:-}"
+BUCKETOOL_REPO="${BUCKETOOL_REPO:-deziss/bucketool}"
+BUCKETOOL_UPDATE_CHANNEL="${BUCKETOOL_UPDATE_CHANNEL:-release}"
+BUCKETOOL_UPDATE_URL="${BUCKETOOL_UPDATE_URL:-}"
 readonly RCLONE_MIN="1.66.0"
 
 # ===========================================================================
 #  Embedded helper: config parsing + backup engine (python3 stdlib only)
 # ===========================================================================
-read -r -d '' S3SYNC_PY <<'PYEOF' || true
+read -r -d '' BUCKETOOL_PY <<'PYEOF' || true
 #!/usr/bin/env python3
-# s3sync helper: config parsing and the backup engine (listing diff, reconcile,
-# hashing, manifests, verify, retention, archives). Called by s3sync.sh.
+# bucketool helper: config parsing and the backup engine (listing diff, reconcile,
+# hashing, manifests, verify, retention, archives). Called by bucketool.sh.
 import sys, os, re, json, gzip, hashlib, fnmatch, stat, time, calendar
 import urllib.parse, tarfile, zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-PROG = 's3sync'
+PROG = 'bucketool'
 TS_RE = re.compile(r'^\d{8}T\d{6}Z$')
 
 
@@ -1525,10 +1525,10 @@ def cmd_metrics(bdir):
     out = []
 
     def g(name, help_, rows):
-        out.append('# HELP s3sync_%s %s' % (name, help_))
-        out.append('# TYPE s3sync_%s gauge' % name)
+        out.append('# HELP bucketool_%s %s' % (name, help_))
+        out.append('# TYPE bucketool_%s gauge' % name)
         for lab, v in rows:
-            out.append('s3sync_%s{label="%s"} %s' % (name, lab.replace('"', ''), v))
+            out.append('bucketool_%s{label="%s"} %s' % (name, lab.replace('"', ''), v))
     data = []
     for lab in labels_in(bdir):
         bs = list_backups(os.path.join(bdir, lab))
@@ -1605,7 +1605,7 @@ def _aws_escape(k):
 
 
 def cmd_aws_sync_args(sd, spec_json, toobig, out):
-    """`aws s3 sync` filter arguments that download exactly the objects s3sync expects."""
+    """`aws s3 sync` filter arguments that download exactly the objects bucketool expects."""
     spec = json.loads(spec_json or '{}')
     args = []
     if spec.get('include'):
@@ -1785,7 +1785,7 @@ PYEOF
 # ===========================================================================
 #  Globals
 # ===========================================================================
-CONFIG="${S3SYNC_CONFIG:-}"
+CONFIG="${BUCKETOOL_CONFIG:-}"
 DRY_RUN=false
 ASSUME_YES=false
 QUIET=false
@@ -1797,8 +1797,8 @@ ALLOW_SHRINK=false
 FORCE=false
 WORST=0                      # 0 ok, 3 warnings, 1 failure — the exit status of a multi-source run
 
-BOOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s3sync.XXXXXXXX")"
-PY="$BOOT_DIR/s3sync.py"
+BOOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bucketool.XXXXXXXX")"
+PY="$BOOT_DIR/bucketool.py"
 RUNDIR=""                    # below backup_dir/.tmp once the config is loaded: docker can see it
 CONTAINER=""                 # the rclone container currently running, killed on exit
 RCLONE_MODE=""
@@ -1889,12 +1889,12 @@ cfg_eval() {
 find_config() {
     [[ -n $CONFIG ]] && { [[ -f $CONFIG ]] || die "config not found: $CONFIG"; return; }
     local c
-    for c in ./s3sync.yml ./s3sync.yaml ./s3sync.json \
-             "$SCRIPT_DIR/s3sync.yml" "$SCRIPT_DIR/s3sync.yaml" "$SCRIPT_DIR/s3sync.json" \
-             /etc/s3sync/s3sync.yml /etc/s3sync/s3sync.yaml /etc/s3sync/s3sync.json; do
+    for c in ./bucketool.yml ./bucketool.yaml ./bucketool.json \
+             "$SCRIPT_DIR/bucketool.yml" "$SCRIPT_DIR/bucketool.yaml" "$SCRIPT_DIR/bucketool.json" \
+             /etc/bucketool/bucketool.yml /etc/bucketool/bucketool.yaml /etc/bucketool/bucketool.json; do
         [[ -f $c ]] && { CONFIG="$c"; return; }
     done
-    die "no config found. Pass -c <file> or create ./s3sync.yml (see s3sync.example.yml)"
+    die "no config found. Pass -c <file> or create ./bucketool.yml (see bucketool.example.yml)"
 }
 
 load_config() {
@@ -1935,9 +1935,9 @@ lock() {  # lock <name> <shared|exclusive> [try]
     else exec {fd}>>"$CFG_BACKUP_DIR/.locks/$name.lock" || die "cannot open lock $name"; LOCK_FDS[$name]=$fd; fi
     flock -n "$mode" "$fd" && return 0
     [[ ${3:-} == try ]] && return 1
-    log "waiting up to ${CFG_LOCK_WAIT}s for lock '$name' (another s3sync run holds it)"
+    log "waiting up to ${CFG_LOCK_WAIT}s for lock '$name' (another bucketool run holds it)"
     flock -w "$CFG_LOCK_WAIT" "$mode" "$fd" && return 0
-    die "lock '$name' is still held by another s3sync run after ${CFG_LOCK_WAIT}s"
+    die "lock '$name' is still held by another bucketool run after ${CFG_LOCK_WAIT}s"
 }
 
 # ===========================================================================
@@ -1949,7 +1949,7 @@ resolve_rclone() {
     [[ -n $RCLONE_MODE ]] && return 0
     local c v
     if [[ $CFG_RCLONE != docker ]]; then
-        for c in "${S3SYNC_RCLONE:-}" "$SCRIPT_DIR/bin/rclone" /opt/s3sync/bin/rclone "$(command -v rclone 2>/dev/null || true)"; do
+        for c in "${BUCKETOOL_RCLONE:-}" "$SCRIPT_DIR/bin/rclone" /opt/bucketool/bin/rclone "$(command -v rclone 2>/dev/null || true)"; do
             [[ -n $c && -x $c ]] || continue
             v="$("$c" version 2>/dev/null | sed -n '1s/^rclone v\([0-9.]*\).*/\1/p')"
             if [[ -n $v ]] && version_ge "$v" "$RCLONE_MIN"; then
@@ -2015,7 +2015,7 @@ container_run() {  # container_run <image> <env-prefix> args...
     for v in $(compgen -e); do [[ $v == "$envp"* ]] && envs+=(-e "$v"); done
     mounts=(--mount "type=bind,src=$CFG_BACKUP_DIR,dst=$CFG_BACKUP_DIR")
     for m in ${DOCKER_MOUNTS[@]+"${DOCKER_MOUNTS[@]}"}; do mounts+=(--mount "type=bind,src=$m,dst=$m"); done
-    CONTAINER="s3sync-$$-$RANDOM"
+    CONTAINER="bucketool-$$-$RANDOM"
     local rc=0
     timeout --kill-after=60 "$CFG_TIMEOUT" docker run --rm -i --init --pull never --name "$CONTAINER" \
         --network host --user "$(id -u):$(id -g)" -e HOME=/tmp ${envs[@]+"${envs[@]}"} "${mounts[@]}" \
@@ -2270,7 +2270,7 @@ s3_read_one() {  # s3_read_one <role> <bucket> <prefix> <key>
 }
 
 s3_write_probe() {  # s3_write_probe <role> <bucket> <prefix>
-    local key; key="$(joinp "$3" ".s3sync-probe-$$")"
+    local key; key="$(joinp "$3" ".bucketool-probe-$$")"
     if [[ $(eng "$1") == aws ]]; then
         echo probe | aws_run "$1" --stdin s3 cp - "s3://$2/$key" --only-show-errors && aws_s3 "$1" rm "s3://$2/$key"
     else
@@ -2356,7 +2356,7 @@ notify() {  # notify <status> <summary>
     fi
     if [[ -n $NOTIFY_WEBHOOK ]] && { (( status != 0 )) || [[ $NOTIFY_ON_SUCCESS == true ]]; }; then
         curl -fsS -m 15 --retry 2 -o /dev/null -X POST -H 'Content-Type: application/json' \
-            -d "{\"tool\":\"s3sync\",\"host\":$(json_str "$(hostname)"),\"status\":\"$word\",\"summary\":$(json_str "$summary")}" \
+            -d "{\"tool\":\"bucketool\",\"host\":$(json_str "$(hostname)"),\"status\":\"$word\",\"summary\":$(json_str "$summary")}" \
             -K <(printf 'url = "%s"\n' "$NOTIFY_WEBHOOK") 2>/dev/null || warn "webhook notification failed"
     fi
     return 0
@@ -2369,7 +2369,7 @@ hc_start() {
 
 write_metrics() {
     [[ -n $METRICS_TEXTFILE_DIR ]] && ! $DRY_RUN || return 0
-    local prom="$METRICS_TEXTFILE_DIR/s3sync.prom"
+    local prom="$METRICS_TEXTFILE_DIR/bucketool.prom"
     { cfgpy metrics "$CFG_BACKUP_DIR" >"$prom.$$" && mv -f "$prom.$$" "$prom"; } 2>/dev/null \
         || warn "cannot write metrics to $METRICS_TEXTFILE_DIR"
 }
@@ -2627,7 +2627,7 @@ backup_label() {  # backup_label <source-name> <bucket> <label>   (SRC_* loaded;
     sync -f "$PART" 2>/dev/null || sync
     mv "$PART" "$ldir/$ts"
     local b="$ldir/$ts"
-    cfgpy meta-set "$b/meta.json" "tool=s3sync" "version=$S3SYNC_VERSION" "label=$label" "source=$name" \
+    cfgpy meta-set "$b/meta.json" "tool=bucketool" "version=$BUCKETOOL_VERSION" "label=$label" "source=$name" \
         "endpoint=$SEP_URL" "endpoint_id=$SEP_ID" "bucket=$bucket" "prefix=$SRC_PREFIX" "format=$SRC_FORMAT" \
         "encrypted=$([[ $SRC_ENCRYPT == age ]] && echo true || echo false)" "created=$ts" "started=$started" \
         "finished=$(now_utc)" "finished_epoch=$(date +%s)" "duration_s=$(( SECONDS - t0 ))" \
@@ -2710,7 +2710,7 @@ cmd_backup() {
         if lock global exclusive try; then
             set +e; ( set -e; prune_all ); local pst=$?; set -e
             (( pst == 0 )) || { warn "prune failed"; worst 3; }
-        else warn "prune skipped: another s3sync run is active"; fi
+        else warn "prune skipped: another bucketool run is active"; fi
     fi
     write_metrics
     local summary
@@ -2789,7 +2789,7 @@ offsite_prune() {  # offsite_prune <label>   (archives and manifests older than 
 #  PRUNE
 # ===========================================================================
 prune_all() {
-    local lab ldir ts why freed total=0 removed=0 now="${S3SYNC_NOW:-$(date +%s)}"
+    local lab ldir ts why freed total=0 removed=0 now="${BUCKETOOL_NOW:-$(date +%s)}"
     local -a labs=()
     mapfile -t labs < <(find "$CFG_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name reports -printf '%f\n' | sort)
     for lab in ${labs[@]+"${labs[@]}"}; do
@@ -2862,7 +2862,7 @@ cmd_verify() {
     lock global shared
     local -a dirs=()
     if [[ -n $path ]]; then
-        [[ -f $path/meta.json ]] || die "$path is not an s3sync backup (no meta.json)"
+        [[ -f $path/meta.json ]] || die "$path is not an bucketool backup (no meta.json)"
         dirs=("$(cd "$path" && pwd)")
     else
         [[ -n $latest ]] || die "verify: give --latest NAME|all or a backup directory"
@@ -2930,7 +2930,7 @@ is_source_bucket() {  # endpoint-id bucket -> name of a source that reads it (st
 pick_backup() {  # pick_backup <latest-name> <at> <file> -> R_BACKUP
     local latest="$1" at="$2" file="$3"
     if [[ -n $file ]]; then
-        [[ -f $file/meta.json ]] || die "$file is not an s3sync backup (no meta.json)"
+        [[ -f $file/meta.json ]] || die "$file is not an bucketool backup (no meta.json)"
         R_BACKUP="$(cd "$file" && pwd)"; return
     fi
     [[ -n $latest ]] || die "give --latest NAME (optionally with --at DATE) or -f BACKUP_DIR"
@@ -3015,7 +3015,7 @@ restore_core() {
     if [[ $fmt == snapshot ]]; then
         # the files must be intact before anything is written (mirror deletes on the target)
         cfgpy verify-tree "$b" "$R_SRCDIR" 0 "$CFG_HASH_WORKERS" "" "$R_SEL" "" >/dev/null \
-            || die "$label/$(basename "$b"): files on disk do not match the manifest — run: s3sync verify $b"
+            || die "$label/$(basename "$b"): files on disk do not match the manifest — run: bucketool verify $b"
     fi
     : >"$RUNDIR/restore.started"
     if [[ -n $todir ]]; then
@@ -3130,7 +3130,7 @@ cmd_drill() {
                     || warn "drill: cleanup of $target failed: $(rclone_err)"
             fi
             {
-                echo "s3sync drill report"
+                echo "bucketool drill report"
                 echo "label:   $lab"
                 echo "backup:  $(basename "$R_BACKUP")"
                 echo "target:  $target ($DEP_URL $(target_root))"
@@ -3175,7 +3175,7 @@ cmd_test() {
                 local -a ra=() r
                 for r in ${SRC_AGE_RECIPIENTS[@]+"${SRC_AGE_RECIPIENTS[@]}"}; do ra+=(-r "$r"); done
                 [[ -n $SRC_AGE_RECIPIENTS_FILE ]] && ra+=(-R "$SRC_AGE_RECIPIENTS_FILE")
-                if [[ "$(echo s3sync | age "${ra[@]}" | age -d -i "$CFG_AGE_IDENTITY_FILE" 2>/dev/null)" == s3sync ]]; then
+                if [[ "$(echo bucketool | age "${ra[@]}" | age -d -i "$CFG_AGE_IDENTITY_FILE" 2>/dev/null)" == bucketool ]]; then
                     ok "$n: age recipients and identity file match"
                 else err "$n: age_identity_file cannot decrypt for the configured recipients"; rc=1; fi
             else warn "$n: no age_identity_file — restores and full verifies of encrypted archives will need one"; fi
@@ -3290,54 +3290,54 @@ cmd_self_update() {
         case "$1" in
             --check) check_only=true; shift ;;
             --force) force=true; shift ;;
-            --main)  S3SYNC_UPDATE_CHANNEL=main; shift ;;
-            --release) S3SYNC_UPDATE_CHANNEL=release; shift ;;
+            --main)  BUCKETOOL_UPDATE_CHANNEL=main; shift ;;
+            --release) BUCKETOOL_UPDATE_CHANNEL=release; shift ;;
             *) die "self-update: unknown option $1 (--check, --force, --main, --release)" ;;
         esac
     done
     have curl || die "self-update needs curl (or update with: git pull && sudo ./install.sh)"
-    local tmp="$BOOT_DIR/s3sync.new" url="$S3SYNC_UPDATE_URL" ref=""
+    local tmp="$BOOT_DIR/bucketool.new" url="$BUCKETOOL_UPDATE_URL" ref=""
     if [[ -z $url ]]; then
-        if [[ $S3SYNC_UPDATE_CHANNEL == release ]]; then
-            ref="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${S3SYNC_REPO}/releases/latest" 2>/dev/null \
+        if [[ $BUCKETOOL_UPDATE_CHANNEL == release ]]; then
+            ref="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${BUCKETOOL_REPO}/releases/latest" 2>/dev/null \
                    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-            [[ -n $ref ]] || die "no published release found for ${S3SYNC_REPO} (use --main to follow the development branch)"
+            [[ -n $ref ]] || die "no published release found for ${BUCKETOOL_REPO} (use --main to follow the development branch)"
         else
             ref=main
         fi
-        url="https://raw.githubusercontent.com/${S3SYNC_REPO}/${ref}/s3sync.sh"
+        url="https://raw.githubusercontent.com/${BUCKETOOL_REPO}/${ref}/bucketool.sh"
     fi
     log "fetching ${ref:+$ref — }$url"
     curl -fsSL --max-time 60 "$url" -o "$tmp" || die "cannot download $url"
-    if [[ -z $S3SYNC_UPDATE_URL && $ref != main ]]; then
+    if [[ -z $BUCKETOOL_UPDATE_URL && $ref != main ]]; then
         # releases publish SHA256SUMS next to the script
         local sums="$BOOT_DIR/SHA256SUMS" want
-        curl -fsSL --max-time 30 "https://github.com/${S3SYNC_REPO}/releases/download/${ref}/SHA256SUMS" -o "$sums" \
+        curl -fsSL --max-time 30 "https://github.com/${BUCKETOOL_REPO}/releases/download/${ref}/SHA256SUMS" -o "$sums" \
             || die "release $ref has no SHA256SUMS — refusing an unverifiable update"
-        want="$(awk '$2 == "s3sync.sh" || $2 == "*s3sync.sh" {print $1}' "$sums")"
+        want="$(awk '$2 == "bucketool.sh" || $2 == "*bucketool.sh" {print $1}' "$sums")"
         [[ -n $want && "$(sha256sum "$tmp" | awk '{print $1}')" == "$want" ]] || die "checksum mismatch for $url — refusing"
         ok "checksum verified against the release's SHA256SUMS"
     fi
     head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || die "downloaded file is not a shell script"
     local newv
-    newv="$(sed -n 's/^readonly S3SYNC_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -1)"
-    [[ -n $newv ]] || die "downloaded file carries no S3SYNC_VERSION — refusing"
+    newv="$(sed -n 's/^readonly BUCKETOOL_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -1)"
+    [[ -n $newv ]] || die "downloaded file carries no BUCKETOOL_VERSION — refusing"
     bash -n "$tmp" || die "downloaded file has a syntax error — refusing"
     if ! $force; then
-        if [[ $newv == "$S3SYNC_VERSION" ]]; then ok "already up to date (v$S3SYNC_VERSION)"; return 0; fi
-        if [[ "$(printf '%s\n%s\n' "$newv" "$S3SYNC_VERSION" | sort -V | tail -1)" == "$S3SYNC_VERSION" ]]; then
-            ok "installed v$S3SYNC_VERSION is newer than v$newv — nothing to do (--force to install it anyway)"; return 0
+        if [[ $newv == "$BUCKETOOL_VERSION" ]]; then ok "already up to date (v$BUCKETOOL_VERSION)"; return 0; fi
+        if [[ "$(printf '%s\n%s\n' "$newv" "$BUCKETOOL_VERSION" | sort -V | tail -1)" == "$BUCKETOOL_VERSION" ]]; then
+            ok "installed v$BUCKETOOL_VERSION is newer than v$newv — nothing to do (--force to install it anyway)"; return 0
         fi
     fi
-    log "installed v$S3SYNC_VERSION — available v$newv"
-    $check_only && { warn "update available: v$S3SYNC_VERSION -> v$newv (run: $SCRIPT_NAME self-update)"; return 10; }
+    log "installed v$BUCKETOOL_VERSION — available v$newv"
+    $check_only && { warn "update available: v$BUCKETOOL_VERSION -> v$newv (run: $SCRIPT_NAME self-update)"; return 10; }
     $DRY_RUN && { ok "dry run: would replace $SCRIPT_PATH with v$newv"; return 0; }
     [[ -w $SCRIPT_PATH ]] || die "$SCRIPT_PATH is not writable — re-run with sudo"
-    local bak="${SCRIPT_PATH}.v${S3SYNC_VERSION}.bak"
+    local bak="${SCRIPT_PATH}.v${BUCKETOOL_VERSION}.bak"
     cp -p "$SCRIPT_PATH" "$bak" || die "cannot keep a backup at $bak"
     cp "$tmp" "${SCRIPT_PATH}.new" && chmod 0755 "${SCRIPT_PATH}.new" && mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH" \
         || die "could not install the new version (old one untouched at $SCRIPT_PATH)"
-    ok "updated $SCRIPT_PATH: v$S3SYNC_VERSION -> v$newv  (previous kept at $(basename "$bak"))"
+    ok "updated $SCRIPT_PATH: v$BUCKETOOL_VERSION -> v$newv  (previous kept at $(basename "$bak"))"
 }
 
 cmd_parse_url() {
@@ -3347,7 +3347,7 @@ cmd_parse_url() {
 
 usage() {
 cat <<EOF
-${SCRIPT_NAME} v${S3SYNC_VERSION} — S3 / MinIO bucket backup, restore and verify
+${SCRIPT_NAME} v${BUCKETOOL_VERSION} — S3 / MinIO bucket backup, restore and verify
 
 USAGE
   ${SCRIPT_NAME} <command> [options]
@@ -3370,10 +3370,10 @@ COMMANDS
   discover [--endpoint E | --url URL] [--sizes]
                                  Buckets on a server and which the config does not cover
   parse-url URL                  Show how an s3:// endpoint URL is read (secret masked)
-  self-update [--check]          Install the newest release of s3sync
+  self-update [--check]          Install the newest release of bucketool
 
 GLOBAL OPTIONS
-  -c, --config FILE   config file (default: ./s3sync.yml, then /etc/s3sync/s3sync.yml)
+  -c, --config FILE   config file (default: ./bucketool.yml, then /etc/bucketool/bucketool.yml)
   -n, --dry-run       show what would happen, change nothing
   -y, --yes           no prompts (needed for cron/systemd and --mode mirror)
   -q, --quiet         only warnings and errors
@@ -3408,14 +3408,14 @@ main() {
             --allow-shrink) ALLOW_SHRINK=true; shift ;;
             --force)      FORCE=true; shift ;;
             -h|--help)    usage; exit 0 ;;
-            -V|--version) echo "$S3SYNC_VERSION"; exit 0 ;;
+            -V|--version) echo "$BUCKETOOL_VERSION"; exit 0 ;;
             -*)           if [[ -n $cmd ]]; then rest+=("$1"); shift
                           else echo "unknown option: $1 (see -h)" >&2; exit 2; fi ;;
             *)            if [[ -z $cmd ]]; then cmd="$1"; else rest+=("$1"); fi; shift ;;
         esac
     done
     [[ -n $cmd ]] || { usage; exit 2; }
-    printf '%s\n' "$S3SYNC_PY" >"$PY"
+    printf '%s\n' "$BUCKETOOL_PY" >"$PY"
     case "$cmd" in
         parse-url) cmd_parse_url ${rest[@]+"${rest[@]}"}; exit $? ;;
         self-update|update) cmd_self_update ${rest[@]+"${rest[@]}"}; exit $? ;;

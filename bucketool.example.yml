@@ -1,14 +1,14 @@
 # ==========================================================================
-#  s3sync.yml — configuration for s3sync.sh
+#  bucketool.yml — configuration for bucketool.sh
 #  ${VAR} and ${VAR:-fallback} are expanded from the environment after
 #  env_file is loaded. Keep secrets in the env file, not here.
 # ==========================================================================
 
-env_file: /etc/s3sync/s3sync.env
+env_file: /etc/bucketool/bucketool.env
 
 defaults:
   backup_dir: /backup/s3            # where backups land (one directory per label)
-  log_file: /var/log/s3sync.log
+  log_file: /var/log/bucketool.log
   format: snapshot                  # snapshot | tar.zst | tar.gz | zip
   compression_level: 6              # zstd 1-19, gzip/zip 1-9 (archives)
   zstd_long: true                   # --long=27: better ratio on big archives
@@ -31,7 +31,7 @@ defaults:
   lock_wait: 3600                   # seconds to wait for another run to finish
   engine: rclone                    # rclone | aws — S3 client; can also be set per endpoint
   rclone: auto                      # auto | native | docker (aws-cli: native v2 if installed, else its container)
-  # age_identity_file: /etc/s3sync/age.key   # needed to restore / fully verify encrypted archives
+  # age_identity_file: /etc/bucketool/age.key   # needed to restore / fully verify encrypted archives
 
 notify:
   webhook: ""                       # POST JSON on failure/warning (and success if on_success)
@@ -48,7 +48,7 @@ offsite:                            # copy every backup to a second S3 (3-2-1)
   prefix: host01
   retention_days: 90                # archives and manifests; enable bucket versioning for snapshot history
 
-drill:                              # weekly restore drill (systemd/s3sync-verify.timer)
+drill:                              # weekly restore drill (systemd/bucketool-verify.timer)
   target: scratch
   sources: [media]
 
@@ -118,6 +118,6 @@ targets:
 
   scratch:
     endpoint: minio_prod
-    bucket: s3sync-drill
+    bucket: bucketool-drill
     create: true
     scratch: true                   # drills only write to targets marked scratch

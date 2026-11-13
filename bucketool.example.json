@@ -1,8 +1,8 @@
 {
-  "env_file": "/etc/s3sync/s3sync.env",
+  "env_file": "/etc/bucketool/bucketool.env",
   "defaults": {
     "backup_dir": "/backup/s3",
-    "log_file": "/var/log/s3sync.log",
+    "log_file": "/var/log/bucketool.log",
     "format": "snapshot",
     "compression_level": 6,
     "zstd_long": true,
@@ -114,7 +114,7 @@
     },
     "scratch": {
       "endpoint": "minio_prod",
-      "bucket": "s3sync-drill",
+      "bucket": "bucketool-drill",
       "create": true,
       "scratch": true
     }

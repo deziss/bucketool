@@ -16,13 +16,13 @@ jobs:
       - name: the tag must match the version in the script
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          ver="$(sed -n 's/^readonly S3SYNC_VERSION="\([^"]*\)".*/\1/p' s3sync.sh | head -1)"
-          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match S3SYNC_VERSION $ver"; exit 1; }
+          ver="$(sed -n 's/^readonly BUCKETOOL_VERSION="\([^"]*\)".*/\1/p' bucketool.sh | head -1)"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match BUCKETOOL_VERSION $ver"; exit 1; }
 
       - name: sanity checks
         run: |
-          bash -n s3sync.sh && bash -n install.sh
-          ./s3sync.sh --version && ./s3sync.sh --help > /dev/null
+          bash -n bucketool.sh && bash -n install.sh
+          ./bucketool.sh --version && ./bucketool.sh --help > /dev/null
           python3 tests/test_py.py
 
       - name: release notes from the changelog
@@ -32,11 +32,11 @@ jobs:
           [ -s notes.md ] || printf 'See [CHANGELOG.md](CHANGELOG.md).\n' > notes.md
 
       - name: checksums
-        run: sha256sum s3sync.sh install.sh > SHA256SUMS
+        run: sha256sum bucketool.sh install.sh > SHA256SUMS
 
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --latest \
-            s3sync.sh install.sh SHA256SUMS
+            bucketool.sh install.sh SHA256SUMS
